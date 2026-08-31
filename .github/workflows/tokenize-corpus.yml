@@ -48,7 +48,7 @@ jobs:
         include:
           - name: greekLit
             tag_name: greeklit
-            repo_url: https://github.com/PerseusDLCode/canonical-greekLit
+            repo_url: https://github.com/PerseusDL/canonical-greekLit
             branch: dev
           - name: latinLit
             tag_name: latinlit
@@ -126,7 +126,7 @@ jobs:
         if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
         uses: actions/checkout@v7
         with:
-          repository: ${{ github.repository_owner }}/${{ matrix.name }}
+          repository: ${{ matrix.repo_url }}
           ref: ${{ matrix.branch }}
           path: corpus
 
