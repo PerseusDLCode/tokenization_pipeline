@@ -35,4 +35,4 @@ packages = ["src/mvp_tokenization"]
 grc-dep-web-lg = { url = "https://huggingface.co/latincy/grc_dep_web_lg/resolve/main/grc_dep_web_lg-3.8.2-py3-none-any.whl" }
 kodon-py = {git="https://github.com/PerseusDLCode/kodon-py", rev = "b925cf4cb7254e641ab50075dbb1048fc9bc5cfc"}
 la-core-web-lg = { url = "https://huggingface.co/latincy/la_core_web_lg/resolve/main/la_core_web_lg-3.9.6-py3-none-any.whl" }
-perseus-cts = {path = "../perseus-cts", editable = true}
+perseus-cts = {git = "https://github.com/PerseusDLCode/perseus-cts", rev = "acd1ba1b94daba5180ad9da5df864a8fa7842e48" }
