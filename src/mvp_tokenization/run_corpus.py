@@ -22,19 +22,12 @@ import argparse
 import json
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from lxml import etree
 from perseus_cts import Chunker, ConfigurationError, LenientTEIDocument
 
-from mvp_tokenization.run_tokenizer import (
-    NLP_URL,
-    TOKENS_DIR,
-    _AbortTokenization,
-    _iter_chunk_files,
-    _process_chunk,
-)
+from mvp_tokenization.run_tokenizer import TOKENS_DIR, tokenize_dir
 
 _CTS_REFSDECL_XPATH = (
     "/*[local-name()='TEI']/*[local-name()='teiHeader']"
@@ -132,47 +125,6 @@ def compile_corpus(
     return entries
 
 
-def tokenize_corpus(
-    proto_dir: Path, tokens_dir: Path | None, nlp_url: str, workers: int, force: bool
-) -> dict:
-    proto_dir = proto_dir.resolve()
-    generated = skipped = failed = 0
-    chunk_files = list(_iter_chunk_files(proto_dir))
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _process_chunk, chunk_file, proto_dir, tokens_dir, nlp_url, force
-            ): chunk_file
-            for chunk_file in chunk_files
-        }
-        try:
-            for future in as_completed(futures):
-                result = future.result()
-                if result == "generated":
-                    generated += 1
-                elif result == "skipped":
-                    skipped += 1
-                else:
-                    failed += 1
-                if (generated + skipped + failed) % 500 == 0:
-                    print(
-                        f"  tokenize: {generated} generated, {skipped} skipped, "
-                        f"{failed} failed so far"
-                    )
-        except _AbortTokenization as exc:
-            print(f"ABORTED: {exc}", file=sys.stderr)
-            pool.shutdown(wait=False, cancel_futures=True)
-            return {
-                "generated": generated,
-                "skipped": skipped,
-                "failed": failed,
-                "aborted": str(exc),
-            }
-
-    return {"generated": generated, "skipped": skipped, "failed": failed}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compile citeStructure-bearing works into citation chunks, "
@@ -184,8 +136,11 @@ def main() -> None:
     )
     parser.add_argument("--proto-dir", required=True, type=Path)
     parser.add_argument("--tokens-dir", type=Path, default=TOKENS_DIR)
-    parser.add_argument("--nlp-url", default=NLP_URL)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--model-dir",
+        default="./stanza_models",
+        help="Directory for stanza model downloads/cache (default: ./stanza_models)",
+    )
     parser.add_argument(
         "--force", action="store_true", help="Recompile/re-tokenize even if outputs exist"
     )
@@ -213,9 +168,9 @@ def main() -> None:
         f"{no_cs} skipped (no citeStructure), {failed_compile} failed."
     )
 
-    print(f"Tokenizing chunks under {proto_dir} via {args.nlp_url} ...")
-    tokenize_result = tokenize_corpus(
-        proto_dir, args.tokens_dir, args.nlp_url, args.workers, args.force
+    print(f"Tokenizing chunks under {proto_dir} ...")
+    tokenize_result = tokenize_dir(
+        proto_dir, args.tokens_dir, args.model_dir, args.force
     )
     print(f"Tokenize: {tokenize_result}")
 
@@ -232,7 +187,7 @@ def main() -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Manifest written to {manifest_path}")
 
-    if failed_compile or tokenize_result.get("failed") or tokenize_result.get("aborted"):
+    if failed_compile or tokenize_result.get("failed"):
         sys.exit(1)
 
 

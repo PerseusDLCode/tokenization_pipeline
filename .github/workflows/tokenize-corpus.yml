@@ -82,13 +82,6 @@ jobs:
         with:
           path: mvp-tokenization
 
-      - name: Checkout nlp_pipeline
-        if: steps.gate.outputs.run == 'true'
-        uses: actions/checkout@v7
-        with:
-          repository: PerseusDLCode/nlp_pipeline
-          path: nlp_pipeline
-
       - name: Resolve corpus HEAD SHA
         if: steps.gate.outputs.run == 'true'
         id: sha
@@ -146,27 +139,8 @@ jobs:
         working-directory: mvp-tokenization
         run: uv sync
 
-      - name: Sync nlp_pipeline
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
-        working-directory: nlp_pipeline
-        run: uv sync
-
-      - name: Start nlp_pipeline server
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
-        working-directory: nlp_pipeline
-        run: |
-          nohup ./scripts/serve.sh 127.0.0.1 8000 > ../nlp_pipeline_serve.log 2>&1 &
-          for i in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:8000/ >/dev/null; then
-              echo "nlp_pipeline is up"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "nlp_pipeline never became ready" >&2
-          cat ../nlp_pipeline_serve.log >&2
-          exit 1
-
+      # Fully in-process (perseus-cts Chunker + mvp_tokenization.run_tokenizer's
+      # tokenize-only models) -- no server to start or wait on.
       - name: Run mvp-pipeline
         if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
         working-directory: mvp-tokenization
@@ -176,8 +150,6 @@ jobs:
             --corpus-root ../corpus \
             --proto-dir ../proto \
             --tokens-dir ../tokens \
-            --nlp-url http://127.0.0.1:8000 \
-            --workers 8 \
             --manifest ../run-manifest.json
 
       - name: Upload run manifest

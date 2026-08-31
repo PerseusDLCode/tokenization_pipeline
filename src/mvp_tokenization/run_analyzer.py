@@ -2,7 +2,7 @@
 """Analyze compiled chunk XML files in-process and (re)write their token sidecars.
 
 This is the standalone-script counterpart to run_tokenizer.py: instead of
-POSTing to a running NLP server's /tokenize endpoint, it loads the
+loading only tokenize-only models, it loads the full
 tokenize+POS+lemma+depparse models directly in this process (stanza for
 most languages, LatinCy's spaCy models for `la`/`grc`) and writes the full
 morphological analysis straight into the same .tokens.json.zst sidecar
@@ -21,8 +21,9 @@ nlp_pipeline's NLPPipeline.analyze. Install the `nlp` dependency group
     python src/mvp_tokenization/run_analyzer.py --proto-dir ./proto-pages --tokens-dir ./tokenized-pages
 
 Sequential by design: stanza/spacy inference is CPU/GPU-bound and the
-per-language pipeline objects cached below aren't meant to be driven
-concurrently, unlike run_tokenizer.py's network calls. Re-running is safe:
+per-language pipeline objects cached below (same reasoning applies to
+run_tokenizer.py's own cached pipelines) aren't meant to be driven
+concurrently. Re-running is safe:
 chunks whose sidecar already exists are skipped unless --force is given --
 pass --force on the first run over sidecars produced by the old
 tokenize-only pass, to upgrade them in place.
