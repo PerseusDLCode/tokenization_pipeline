@@ -1,0 +1,38 @@
+[project]
+name = "mvp-tokenization"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Charles Pletcher", email = "cpletcher2@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "grc-dep-web-lg==3.8.2",
+    "la-core-web-lg==3.9.6",
+    "kodon-py",
+    "lxml>=6.0.4",
+    "lxml-stubs>=0.5.1",
+    "perseus-cts",
+    "spacy>=3.8.15",
+    "stanza>=1.14.0",
+    "zstandard>=0.23.0",
+]
+
+[project.scripts]
+mvp-tokenize = "mvp_tokenization.run_tokenizer:main"
+mvp-analyze = "mvp_tokenization.run_analyzer:main"
+mvp-pipeline = "mvp_tokenization.run_corpus:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mvp_tokenization"]
+
+[tool.uv.sources]
+grc-dep-web-lg = { url = "https://huggingface.co/latincy/grc_dep_web_lg/resolve/main/grc_dep_web_lg-3.8.2-py3-none-any.whl" }
+kodon-py = {git="https://github.com/PerseusDLCode/kodon-py", rev = "b925cf4cb7254e641ab50075dbb1048fc9bc5cfc"}
+la-core-web-lg = { url = "https://huggingface.co/latincy/la_core_web_lg/resolve/main/la_core_web_lg-3.9.6-py3-none-any.whl" }
+perseus-cts = {path = "../perseus-cts", editable = true}
