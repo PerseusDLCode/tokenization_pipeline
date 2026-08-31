@@ -49,22 +49,32 @@ jobs:
           - name: greekLit
             tag_name: greeklit
             repo_url: https://github.com/PerseusDL/canonical-greekLit
-            branch: dev
+            repo_owner: PerseusDL
+            repo_name: canonical-greekLit
+            branch: master
           - name: latinLit
             tag_name: latinlit
             repo_url: https://github.com/PerseusDLCode/canonical-latinLit
+            repo_owner: PerseusDLCode
+            repo_name: canonical-latinLit
             branch: dev
           - name: First1KGreek
             tag_name: first1kgreek
             repo_url: https://github.com/PerseusDLCode/First1KGreek
+            repo_owner: PerseusDLCode
+            repo_name: First1KGreek
             branch: editing
           - name: Notre-Dame-Digitized-Latin-Collection
             tag_name: nd-dlc
             repo_url: https://github.com/PerseusDLCode/Notre-Dame-Digitized-Latin-Collection
+            repo_owner: PerseusDLCode
+            repo_name: Notre-Dame-Digitized-Latin-Collection
             branch: main
           - name: grcnewxml
             tag_name: grcnewxml
             repo_url: https://github.com/gregorycrane/grcnewxml.git
+            repo_owner: gregorycrane
+            repo_name: grcnewxml
             branch: main
     steps:
       - name: Skip corpora not requested via workflow_dispatch
@@ -126,7 +136,7 @@ jobs:
         if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
         uses: actions/checkout@v7
         with:
-          repository: ${{ matrix.repo_url }}
+          repository: ${{ matrix.repo_owner }}/${{ matrix.repo_name }}
           ref: ${{ matrix.branch }}
           path: corpus
 
