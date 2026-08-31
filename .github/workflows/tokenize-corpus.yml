@@ -1,0 +1,210 @@
+name: Tokenize corpus (fast pass)
+
+# Runs mvp-pipeline (perseus-cts Chunker compile -> fast tokenize-only pass)
+# against one or all of the citeStructure-bearing corpora, and pushes the
+# resulting tokenized-pages tree as a per-corpus OCI artifact to GHCR --
+# mirroring MinimumViablePerseus/build-corpus.yml's pages/manifest split
+# (SHA-tagged, skip-if-already-built, main->latest/dev->staging aliasing) so
+# that workflow can pull tokens the same way it already pulls canonical-
+# pdlrefwk, instead of committing hundreds of thousands of sidecar files
+# into the tokenized-pages git repo.
+#
+# Whole-corpus granularity, not per-work: matches build-corpus.yml's own
+# skip-if-SHA-unchanged model rather than inventing a finer-grained one.
+#
+# Manual dispatch only for now -- there's no existing cross-repo trigger
+# from a corpus push today (build-corpus.yml itself is only triggered by
+# pushes to MinimumViablePerseus), and citeStructure migration is still in
+# progress, so an accidental full run isn't something to trigger blindly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus:
+        description: >-
+          Tokenize only this corpus (greekLit, latinLit, First1KGreek,
+          Notre-Dame-Digitized-Latin-Collection, grcnewxml). Leave blank for
+          all five.
+        required: false
+      force:
+        description: >-
+          Rebuild and push even if this corpus's SHA already has a pushed
+          tokens artifact.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tokenize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - name: greekLit
+            tag_name: greeklit
+            repo_url: https://github.com/PerseusDLCode/canonical-greekLit
+            branch: dev
+          - name: latinLit
+            tag_name: latinlit
+            repo_url: https://github.com/PerseusDLCode/canonical-latinLit
+            branch: dev
+          - name: First1KGreek
+            tag_name: first1kgreek
+            repo_url: https://github.com/PerseusDLCode/First1KGreek
+            branch: editing
+          - name: Notre-Dame-Digitized-Latin-Collection
+            tag_name: nd-dlc
+            repo_url: https://github.com/PerseusDLCode/Notre-Dame-Digitized-Latin-Collection
+            branch: main
+          - name: grcnewxml
+            tag_name: grcnewxml
+            repo_url: https://github.com/gregorycrane/grcnewxml.git
+            branch: main
+    steps:
+      - name: Skip corpora not requested via workflow_dispatch
+        id: gate
+        run: |
+          if [ -n "${{ inputs.corpus }}" ] && [ "${{ inputs.corpus }}" != "${{ matrix.name }}" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout mvp-tokenization (this repo)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v7
+        with:
+          path: mvp-tokenization
+
+      - name: Checkout nlp_pipeline
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: PerseusDLCode/nlp_pipeline
+          path: nlp_pipeline
+
+      - name: Resolve corpus HEAD SHA
+        if: steps.gate.outputs.run == 'true'
+        id: sha
+        run: |
+          CORPUS_SHA=$(git ls-remote "${{ matrix.repo_url }}" "refs/heads/${{ matrix.branch }}" | cut -f1)
+          if [ -z "$CORPUS_SHA" ]; then
+            echo "Could not resolve HEAD SHA for ${{ matrix.repo_url }}@${{ matrix.branch }}" >&2
+            exit 1
+          fi
+          echo "corpus=${CORPUS_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install oras
+        if: steps.gate.outputs.run == 'true'
+        uses: oras-project/setup-oras@v2
+
+      - name: Skip if this corpus's SHA is already tokenized
+        if: steps.gate.outputs.run == 'true'
+        id: skip
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "force=true; retokenizing regardless of cached SHA."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="ghcr.io/perseusdlcode/mvp-tokens-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}"
+          if oras manifest fetch "$TAG" >/dev/null 2>&1; then
+            echo "Already tokenized: $TAG"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout ${{ matrix.name }}
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/${{ matrix.name }}
+          ref: ${{ matrix.branch }}
+          path: corpus
+
+      - name: Install uv
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        uses: astral-sh/setup-uv@v7
+
+      - name: Sync mvp-tokenization
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        working-directory: mvp-tokenization
+        run: uv sync
+
+      - name: Sync nlp_pipeline
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        working-directory: nlp_pipeline
+        run: uv sync
+
+      - name: Start nlp_pipeline server
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        working-directory: nlp_pipeline
+        run: |
+          nohup ./scripts/serve.sh 127.0.0.1 8000 > ../nlp_pipeline_serve.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8000/ >/dev/null; then
+              echo "nlp_pipeline is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "nlp_pipeline never became ready" >&2
+          cat ../nlp_pipeline_serve.log >&2
+          exit 1
+
+      - name: Run mvp-pipeline
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        working-directory: mvp-tokenization
+        run: |
+          mkdir -p ../proto ../tokens
+          uv run mvp-pipeline \
+            --corpus-root ../corpus \
+            --proto-dir ../proto \
+            --tokens-dir ../tokens \
+            --nlp-url http://127.0.0.1:8000 \
+            --workers 8 \
+            --manifest ../run-manifest.json
+
+      - name: Upload run manifest
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: run-manifest-${{ matrix.tag_name }}
+          path: run-manifest.json
+          retention-days: 30
+
+      - name: Package tokenized-pages
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        run: tar --zstd -cf tokens.tar.zst -C tokens .
+
+      - name: Push tokens artifact
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        run: |
+          oras push "ghcr.io/perseusdlcode/mvp-tokens-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}" \
+            tokens.tar.zst:application/vnd.perseus.mvp.tokens
+
+      # No dev/staging channel here (unlike build-corpus.yml, which mirrors
+      # MinimumViablePerseus's own branch): this workflow is dispatched
+      # manually, once, against whatever the corpus's tracked branch
+      # currently is, so "latest" always means "most recently tokenized" --
+      # build-corpus.yml's "fetch tokens artifact" step should just pull this
+      # unconditionally, the same way it fetches canonical-pdlrefwk.
+      - name: Tag tokens artifact as latest
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          oras tag "ghcr.io/perseusdlcode/mvp-tokens-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}" latest
