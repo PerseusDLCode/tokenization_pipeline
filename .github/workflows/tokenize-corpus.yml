@@ -56,7 +56,7 @@ jobs:
             repo_url: https://github.com/PerseusDL/canonical-latinLit
             repo_owner: PerseusDLCode
             repo_name: canonical-latinLit
-            branch: dev
+            branch: master
           - name: First1KGreek
             tag_name: first1kgreek
             repo_url: https://github.com/PerseusDLCode/First1KGreek
