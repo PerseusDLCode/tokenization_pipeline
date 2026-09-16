@@ -11,3 +11,4 @@ wheels/
 
 # Downloaded stanza model cache
 stanza_models/
+.envrc
