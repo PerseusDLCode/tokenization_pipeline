@@ -1,7 +1,7 @@
 [project]
 name = "mvp-tokenization"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tokenization, lemmatization, and corpus search indexing for MinimumViablePerseus"
 readme = "README.md"
 authors = [
     { name = "Charles Pletcher", email = "cpletcher2@gmail.com" }
@@ -23,6 +23,10 @@ dependencies = [
 mvp-tokenize = "mvp_tokenization.run_tokenizer:main"
 mvp-analyze = "mvp_tokenization.run_analyzer:main"
 mvp-pipeline = "mvp_tokenization.run_corpus:main"
+mvp-index = "mvp_tokenization.build_index:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
