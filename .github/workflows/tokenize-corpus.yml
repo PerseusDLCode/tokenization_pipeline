@@ -15,10 +15,14 @@ name: Tokenize corpus
 # mvp-tokenize only reprocesses chunks whose XML or pipeline version
 # changed (see run_tokenizer.py's tokens-manifest.json), so a nightly run
 # against an unchanged corpus is skipped outright and a run after a commit
-# only pays for what that commit touched. The very first lemmatizing run
-# over the large corpora (greekLit, First1KGreek) can exceed a hosted
-# runner's time limit; backfill those once locally with mvp-pipeline and
-# `oras push` the result under :latest.
+# only pays for what that commit touched.
+#
+# A run that can't finish within the job's time limit (e.g. the first
+# lemmatizing pass over First1KGreek) stops tokenizing after
+# TIME_BUDGET_MINUTES, pushes what it has under a "-partial-<run id>" tag
+# (and :latest), and dispatches this workflow again for that corpus; the
+# next run restores :latest and carries on. Only a complete run pushes the
+# plain <corpus sha>-<repo sha> tag the skip check looks for.
 
 on:
   schedule:
@@ -46,10 +50,8 @@ on:
 permissions:
   contents: read
   packages: write
-
-concurrency:
-  group: tokenize-corpus
-  cancel-in-progress: false
+  # To dispatch a follow-up run when the time budget runs out.
+  actions: write
 
 jobs:
   corpora:
@@ -65,6 +67,13 @@ jobs:
     needs: corpora
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    # One run per corpus at a time, since each restores and replaces that
+    # corpus's :latest. Per corpus, not per workflow: GitHub keeps only one
+    # pending run per group, so a shared group would let one corpus's
+    # follow-up dispatch cancel another's.
+    concurrency:
+      group: tokenize-${{ matrix.tag_name }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -73,6 +82,9 @@ jobs:
     env:
       REQUESTED: ${{ inputs.corpus || github.event.client_payload.corpus }}
       ARTIFACT: ghcr.io/perseusdlcode/mvp-tokens-${{ matrix.tag_name }}
+      # Leaves time inside timeout-minutes for restoring, syncing,
+      # compressing and pushing, which take a while for the big corpora.
+      TIME_BUDGET_MINUTES: 280
     steps:
       - name: Skip corpora that weren't requested
         id: gate
@@ -169,6 +181,7 @@ jobs:
       # is still pushed.
       - name: Run mvp-pipeline
         if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        id: pipeline
         working-directory: mvp-tokenization
         run: |
           mkdir -p ../proto
@@ -178,12 +191,16 @@ jobs:
             --proto-dir ../proto \
             --tokens-dir ../tokens \
             --manifest ../run-manifest.json \
-            --prune
+            --prune \
+            --time-budget-minutes "$TIME_BUDGET_MINUTES"
           status=$?
+          set -e
           if [ $status -ne 0 ]; then
             echo "::warning::mvp-pipeline exited $status for ${{ matrix.name }}; see the run manifest artifact."
           fi
           test -f ../run-manifest.json
+          echo "generated=$(jq '.tokenize.generated // 0' ../run-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "deferred=$(jq '.tokenize.deferred // 0' ../run-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload run manifest
         if: always() && steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
@@ -196,7 +213,26 @@ jobs:
       - name: Push tokens artifact
         if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
         run: |
+          tag="${{ steps.sha.outputs.tag }}"
+          if [ "${{ steps.pipeline.outputs.deferred }}" != "0" ]; then
+            # Not the tag the skip check looks for, so the follow-up run
+            # isn't skipped.
+            tag="${tag}-partial-${GITHUB_RUN_ID}"
+          fi
           tar --zstd -cf tokens.tar.zst -C tokens .
-          oras push "$ARTIFACT:${{ steps.sha.outputs.tag }}" \
-            tokens.tar.zst:application/vnd.perseus.mvp.tokens
-          oras tag "$ARTIFACT:${{ steps.sha.outputs.tag }}" latest
+          oras push "$ARTIFACT:${tag}" tokens.tar.zst:application/vnd.perseus.mvp.tokens
+          oras tag "$ARTIFACT:${tag}" latest
+
+      - name: Continue in a follow-up run
+        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true' && steps.pipeline.outputs.deferred != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.pipeline.outputs.generated }}" = "0" ]; then
+            echo "::error::Time budget ran out before tokenizing anything for ${{ matrix.name }}; not dispatching a follow-up."
+            exit 1
+          fi
+          echo "${{ steps.pipeline.outputs.deferred }} chunks left for ${{ matrix.name }}; dispatching a follow-up run."
+          gh workflow run tokenize-corpus.yml \
+            --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f corpus="${{ matrix.name }}"

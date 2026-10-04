@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import unicodedata
 from collections import Counter
 from importlib.metadata import version as package_version
@@ -336,17 +337,26 @@ def _is_up_to_date(entry: dict | None, source_sha: str, sidecar: Path) -> bool:
     )
 
 
+def _past(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def _process_chunks(
     chunk_files: list[Path],
     sidecar_dir: Path,
     manifest: dict[str, dict],
     model_dir: str,
     force: bool,
+    deadline: float | None = None,
 ) -> Counter[str]:
     """Tokenize one version dir's out-of-date chunks as a batch, writing
     their sidecars and updating `manifest` in place.
 
-    Returns generated/skipped/failed counts."""
+    Out-of-date chunks reached after `deadline` (a time.monotonic() value)
+    are left alone and counted as "deferred": they get no manifest entry, so
+    the next run picks them up.
+
+    Returns generated/skipped/failed/deferred counts."""
     counts: Counter[str] = Counter()
     pending: list[tuple[Path, str, str, str]] = []  # (chunk, sha, urn, text)
     for chunk_file in chunk_files:
@@ -354,6 +364,9 @@ def _process_chunks(
         sidecar = sidecar_dir / token_sidecar_name(chunk_file)
         if not force and _is_up_to_date(manifest.get(chunk_file.name), source_sha, sidecar):
             counts["skipped"] += 1
+            continue
+        if _past(deadline):
+            counts["deferred"] += 1
             continue
         try:
             cts_urn, primary_text = _primary_text(chunk_file)
@@ -364,6 +377,9 @@ def _process_chunks(
         pending.append((chunk_file, source_sha, cts_urn, primary_text))
 
     for start in range(0, len(pending), _BATCH_SIZE):
+        if _past(deadline):
+            counts["deferred"] += len(pending) - start
+            break
         batch = pending[start : start + _BATCH_SIZE]
         results = _tokenize_batch([(urn, text) for _f, _s, urn, text in batch], model_dir)
         compressor = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
@@ -427,6 +443,7 @@ def tokenize_dir(
     model_dir: str = "./stanza_models",
     force: bool = False,
     prune: bool = False,
+    time_budget: float | None = None,
 ) -> dict:
     """Tokenize every compiled chunk under proto_dir.
 
@@ -434,9 +451,16 @@ def tokenize_dir(
     chunks and works that are no longer in proto_dir -- use it when
     proto_dir holds a complete compile of the corpus, as it does in CI.
 
-    Returns generated/skipped/failed (and pruned) counts."""
+    With `time_budget` (seconds), stops tokenizing once it's spent, between
+    batches, and reports the chunks it didn't get to as "deferred"; output
+    so far is complete and consistent, so rerunning continues where this
+    left off. CI uses this to finish inside a job's time limit, and pushes
+    what it has rather than losing it.
+
+    Returns generated/skipped/failed/deferred (and pruned) counts."""
     proto_dir = proto_dir.resolve()
-    generated = skipped = failed = pruned = 0
+    generated = skipped = failed = deferred = pruned = 0
+    deadline = time.monotonic() + time_budget if time_budget is not None else None
 
     for version_dir, chunk_files in _iter_chunk_dirs(proto_dir):
         if tokens_dir is not None:
@@ -449,10 +473,13 @@ def tokenize_dir(
             sidecar_dir = version_dir
 
         manifest = _load_tokens_manifest(sidecar_dir)
-        counts = _process_chunks(chunk_files, sidecar_dir, manifest, model_dir, force)
+        counts = _process_chunks(
+            chunk_files, sidecar_dir, manifest, model_dir, force, deadline
+        )
         generated += counts["generated"]
         skipped += counts["skipped"]
         failed += counts["failed"]
+        deferred += counts["deferred"]
         if counts["generated"] or counts["failed"]:
             print(
                 f"{version_dir.relative_to(proto_dir)}: {counts['generated']} generated, "
@@ -471,10 +498,14 @@ def tokenize_dir(
     if prune and tokens_dir is not None:
         pruned += _prune_missing_works(proto_dir, tokens_dir)
 
+    if deferred:
+        print(f"Time budget spent: {deferred} chunks deferred to the next run.", flush=True)
+
     return {
         "generated": generated,
         "skipped": skipped,
         "failed": failed,
+        "deferred": deferred,
         "pruned": pruned,
     }
 
@@ -518,15 +549,26 @@ def main() -> None:
         action="store_true",
         help="Delete sidecars for chunks/works no longer in --proto-dir",
     )
+    parser.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=None,
+        help="Stop tokenizing after this long, leaving the rest for the next run",
+    )
     args = parser.parse_args()
 
     result = tokenize_dir(
-        args.proto_dir, args.tokens_dir, args.model_dir, args.force, args.prune
+        args.proto_dir,
+        args.tokens_dir,
+        args.model_dir,
+        args.force,
+        args.prune,
+        args.time_budget_minutes * 60 if args.time_budget_minutes is not None else None,
     )
     print(
         f"Tokenization: {result['generated']} generated, "
         f"{result['skipped']} skipped, {result['failed']} failed, "
-        f"{result['pruned']} pruned."
+        f"{result['deferred']} deferred, {result['pruned']} pruned."
     )
 
 

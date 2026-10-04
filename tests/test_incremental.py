@@ -88,3 +88,17 @@ def test_prune_removes_deleted_chunks_and_works(tmp_path, calls):
     run_tokenizer.tokenize_dir(proto, tokens, prune=True)
     assert not gone.exists()
     assert version.exists()
+
+
+def test_time_budget_defers_and_next_run_resumes(tmp_path, calls):
+    proto = _proto(tmp_path, {"1.xml": "<a/>", "2.xml": "<b/>"})
+    tokens = tmp_path / "tokens"
+
+    result = run_tokenizer.tokenize_dir(proto, tokens, time_budget=0)
+    assert (result["generated"], result["deferred"]) == (0, 2)
+    assert calls == []
+    version = tokens / "latinLit" / "phi0690" / "phi003" / "perseus-lat2"
+    assert (version / "metadata.json").exists()
+
+    result = run_tokenizer.tokenize_dir(proto, tokens)
+    assert (result["generated"], result["deferred"]) == (2, 0)

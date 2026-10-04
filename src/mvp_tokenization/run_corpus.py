@@ -99,6 +99,13 @@ def compile_corpus(
             print(f"  FAILED (compile): {rel}: {exc}", file=sys.stderr)
             continue
 
+        if not base_urn.startswith("urn:cts:") or base_urn.count(":") < 3:
+            # e.g. a <body xml:base> holding the filename instead of a URN.
+            reason = f"base URN {base_urn!r} is not a CTS URN (check <body xml:base>)"
+            entries.append({"path": str(rel), "status": "failed", "reason": reason})
+            print(f"  FAILED (compile): {rel}: {reason}", file=sys.stderr)
+            continue
+
         output_path = _work_output_dir(proto_dir, base_urn)
         index_file = output_path / "index.json"
         if index_file.exists() and not force:
@@ -152,6 +159,14 @@ def main() -> None:
         help="Delete sidecars for chunks/works no longer in --proto-dir",
     )
     parser.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=None,
+        help="Stop tokenizing after this long (counting from the start of the run, "
+        "compile included), leaving the rest for the next run; the run manifest's "
+        "tokenize.deferred says how much",
+    )
+    parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
@@ -164,6 +179,11 @@ def main() -> None:
     manifest_path = args.manifest or (proto_dir / "_run-manifest.json")
 
     started = time.time()
+    deadline = (
+        started + args.time_budget_minutes * 60
+        if args.time_budget_minutes is not None
+        else None
+    )
     print(f"Compiling citeStructure works from {corpus_root} ...")
     works = compile_corpus(corpus_root, proto_dir, args.force)
     compiled = sum(1 for w in works if w["status"] == "compiled")
@@ -177,7 +197,12 @@ def main() -> None:
 
     print(f"Tokenizing chunks under {proto_dir} ...")
     tokenize_result = tokenize_dir(
-        proto_dir, args.tokens_dir, args.model_dir, args.force, args.prune
+        proto_dir,
+        args.tokens_dir,
+        args.model_dir,
+        args.force,
+        args.prune,
+        max(0.0, deadline - time.time()) if deadline is not None else None,
     )
     print(f"Tokenize: {tokenize_result}")
 

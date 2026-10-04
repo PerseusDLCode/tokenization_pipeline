@@ -97,18 +97,20 @@ looks up their keys here, so the index has no dependency on Morpheus data.
 **To add a corpus,** add it to `corpora.json`. Both workflows read that list.
 The search index then picks the corpus up automatically.
 
-### First run
+### Long runs
 
 A run for an unchanged corpus finishes in seconds. The first lemmatizing run
-does every chunk, at roughly 5,000 words/s for Greek and 1,000 words/s for
-Latin on one CPU core. Within one runner's 6-hour limit that fits each of the
-current corpora. If a corpus outgrows it, run `mvp-pipeline` once locally and
-push the result as `mvp-tokens-<tag>:latest`. Every later run is incremental.
+does every chunk, at roughly 5,000 words/s for Greek and 1,000 for Latin on
+one core, which for the big corpora is longer than a hosted runner allows. So
+the workflow runs `mvp-pipeline --time-budget-minutes`, which stops between
+batches when the budget is spent. It then pushes what it has (tagged
+`<sha>-partial-<run id>` and `:latest`) and dispatches itself again for that
+corpus. Each follow-up restores `:latest` and continues. Only a complete run
+pushes the plain tag that later runs check before skipping.
 
-```sh
-tar --zstd -cf tokens.tar.zst -C tokens .
-oras push ghcr.io/perseusdlcode/mvp-tokens-<tag>:latest tokens.tar.zst:application/vnd.perseus.mvp.tokens
-```
+Files that fail to compile, such as a `<body xml:base>` that isn't a CTS URN,
+are recorded as `failed` in the run manifest (uploaded as a workflow
+artifact) and skipped. They don't stop the run.
 
 ## Tests
 
