@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Tokenize compiled chunk XML files in-process (fast pass: tokenize-only).
+"""Tokenize compiled chunk XML files in-process, lemmatizing Greek and Latin.
 
-Standalone counterpart to run_analyzer.py: loads only the tokenize-only
-stanza pipeline (processors="tokenize") or spaCy's bare tokenizer
-(la_core_web_lg/grc_dep_web_lg's `.tokenizer`, not the full pipeline) --
-no POS/lemma/depparse, and no NLP server or nlp_pipeline dependency at all.
-Sidecar schema matches run_analyzer.py's exactly (mostly-null morphological
-fields here); run --force with mvp-analyze later to upgrade a sidecar in
-place with full analysis, whenever that's actually wanted.
+Greek and Latin chunks go through LatinCy's spaCy pipeline -- tagger,
+morphologizer and lemmatizers, minus the parser and NER, which nothing
+downstream uses -- because the corpus search index (build_index.py) needs a
+lemma and morphology for every token. Every other language gets stanza's
+tokenize-only pipeline (processors="tokenize"); mvp-analyze can still
+upgrade those sidecars in place with full analysis. No NLP server or
+nlp_pipeline dependency at all.
+
+Incremental: each sidecar directory carries a tokens-manifest.json recording,
+per chunk, a hash of the chunk XML and the pipeline version that produced
+the sidecar. A chunk is reprocessed only when either changes (or with
+--force), so restoring the previous run's output and re-running only pays
+for new and edited texts.
 
 Sequential by design, same reasoning as run_analyzer.py: the cached
 per-language pipeline objects below aren't meant to be driven concurrently.
@@ -18,10 +24,14 @@ HTTP path's server-liveness/readiness problem in CI).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sys
 import unicodedata
+from collections import Counter
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import spacy
@@ -37,6 +47,25 @@ from stanza.pipeline.core import Pipeline as StanzaPipeline
 TOKENS_DIR = os.getenv("MVP_TOKENS_DIR", "tokenized-pages")
 
 _ZSTD_LEVEL = 19
+# Chunks per model call (and per sidecar-writing round). Bounds memory for
+# works with thousands of chunks while keeping batches large enough to
+# amortize per-call overhead.
+_BATCH_SIZE = 256
+
+# Bump when the sidecar contents change for reasons the model versions don't
+# capture (e.g. how token text or URNs are derived), to force a rebuild.
+SIDECAR_SCHEMA = 2
+
+TOKENS_MANIFEST = "tokens-manifest.json"
+# Copied verbatim from each proto version dir so the tokens artifact alone
+# carries document metadata and chunk order (build_index.py reads them).
+PROTO_METADATA_FILES = ("metadata.json", "index.json")
+
+# Languages that get the full (lemmatizing) spaCy pipeline. Must be a subset
+# of SPACY_MODELS.
+ANALYZE_LANGS = frozenset({"la", "grc"})
+# Unused by search and the most expensive components to run.
+SPACY_EXCLUDE = ["parser", "ner"]
 
 # Latin and Ancient Greek are handled by LatinCy's spaCy models rather than a
 # stanza package -- see nlp_pipeline/src/nlp_pipeline/pipeline.py, which
@@ -81,12 +110,6 @@ def _get_langid(model_dir: str) -> StanzaPipeline:
     return _langid
 
 
-def _identify_lang(text: str, model_dir: str) -> str:
-    doc = StanzaDocument([], text=text)
-    _get_langid(model_dir)(doc)
-    return doc.lang
-
-
 def _get_stanza_pipeline(lang: str, model_dir: str) -> StanzaPipeline:
     if lang not in _stanza_tokenize:
         _stanza_tokenize[lang] = stanza.Pipeline(
@@ -100,8 +123,20 @@ def _get_stanza_pipeline(lang: str, model_dir: str) -> StanzaPipeline:
 
 def _get_spacy_pipeline(lang: str) -> SpacyLanguage:
     if lang not in _spacy_pipelines:
-        _spacy_pipelines[lang] = spacy.load(SPACY_MODELS[lang])
+        _spacy_pipelines[lang] = spacy.load(SPACY_MODELS[lang], exclude=SPACY_EXCLUDE)
     return _spacy_pipelines[lang]
+
+
+def pipeline_version(lang: str) -> str:
+    """Identify everything that determines a sidecar's contents for `lang`."""
+    if lang in SPACY_MODELS:
+        model = SPACY_MODELS[lang]
+        mode = "analyze" if lang in ANALYZE_LANGS else "tokenize"
+        model_version = package_version(model.replace("_", "-"))
+        return f"{SIDECAR_SCHEMA}:spacy-{spacy.__version__}:{model}-{model_version}:{mode}"
+    if lang:
+        return f"{SIDECAR_SCHEMA}:stanza-{stanza.__version__}:tokenize"
+    return f"{SIDECAR_SCHEMA}:empty"
 
 
 def _stanza_token_dicts(doc: StanzaDocument) -> list[dict]:
@@ -165,26 +200,20 @@ def _spacy_token_dicts(doc: SpacyDoc) -> list[dict]:
     ]
 
 
-def _tokenize_only(
-    chunk_urn: str, primary_text: str, model_dir: str
-) -> tuple[str, list[dict]]:
-    if not primary_text.strip():
-        return "", []
-
-    lang = _identify_lang(primary_text, model_dir)
-
-    if lang in SPACY_MODELS:
-        # Bare tokenizer, not the full pipeline call -- no tagger/parser/
-        # lemmatizer inference, even though the model is loaded (same
-        # tradeoff nlp_pipeline's NLPPipeline.tokenize() makes).
-        raw_tokens = _spacy_token_dicts(_get_spacy_pipeline(lang).tokenizer(primary_text))
-    else:
-        raw_tokens = _stanza_token_dicts(_get_stanza_pipeline(lang, model_dir)(primary_text))
-
+def _finalize_tokens(
+    chunk_urn: str, primary_text: str, raw_tokens: list[dict]
+) -> list[dict]:
+    """Assign each token its source text, identifier, and URN."""
     token_counts: dict[str, int] = {}
     tokens = []
     for token in raw_tokens:
-        text = token["text"].strip()
+        # Take the text from the source, not the model: LatinCy's Latin
+        # tokenizer normalizes u/v (so "virumque" comes back as "uirumque"),
+        # and the reading view renders token text verbatim.
+        text = (
+            primary_text[token["start_char"] : token["end_char"]].strip()
+            or token["text"].strip()
+        )
         if not text:
             continue
         count = token_counts.get(text, 0) + 1
@@ -192,8 +221,69 @@ def _tokenize_only(
         identifier = f"{text}[{count}]"
         urn = None if _is_punct(text) else f"{chunk_urn}@{identifier}"
         tokens.append({**token, "identifier": identifier, "urn": urn, "text": text})
+    return tokens
 
-    return lang, tokens
+
+def _raw_tokens(lang: str, texts: list[str], model_dir: str) -> list[list[dict]]:
+    if lang in ANALYZE_LANGS:
+        # Batched: per-call overhead dominates for short chunks.
+        docs = _get_spacy_pipeline(lang).pipe(texts, batch_size=64)
+        return [_spacy_token_dicts(doc) for doc in docs]
+    if lang in SPACY_MODELS:
+        # Bare tokenizer, not the full pipeline -- no tagger/lemmatizer
+        # inference, even though the model is loaded.
+        docs = _get_spacy_pipeline(lang).tokenizer.pipe(texts)
+        return [_spacy_token_dicts(doc) for doc in docs]
+    pipeline = _get_stanza_pipeline(lang, model_dir)
+    return [_stanza_token_dicts(pipeline(text)) for text in texts]
+
+
+def _tokenize_batch(
+    items: list[tuple[str, str]], model_dir: str
+) -> list[tuple[str, list[dict]] | Exception]:
+    """Tokenize (chunk_urn, primary_text) pairs, batching language
+    identification and, per language, the models themselves.
+
+    Returns one (lang, tokens) pair per item, or the exception that item
+    raised: a batch that fails is retried an item at a time, so one bad
+    chunk can't take down its neighbors."""
+    results: list[tuple[str, list[dict]] | Exception] = [("", [])] * len(items)
+    nonempty = [i for i, (_urn, text) in enumerate(items) if text.strip()]
+    if not nonempty:
+        return results
+
+    docs = [StanzaDocument([], text=items[i][1]) for i in nonempty]
+    _get_langid(model_dir)(docs)
+    by_lang: dict[str, list[int]] = {}
+    for i, doc in zip(nonempty, docs):
+        by_lang.setdefault(doc.lang, []).append(i)
+
+    for lang, indices in by_lang.items():
+        try:
+            raw = _raw_tokens(lang, [items[i][1] for i in indices], model_dir)
+        except Exception:
+            raw = []
+            for i in indices:
+                try:
+                    raw.extend(_raw_tokens(lang, [items[i][1]], model_dir))
+                except Exception as exc:
+                    raw.append(exc)
+        for i, tokens in zip(indices, raw):
+            urn, text = items[i]
+            results[i] = (
+                tokens if isinstance(tokens, Exception)
+                else (lang, _finalize_tokens(urn, text, tokens))
+            )
+    return results
+
+
+def _tokenize(
+    chunk_urn: str, primary_text: str, model_dir: str
+) -> tuple[str, list[dict]]:
+    result = _tokenize_batch([(chunk_urn, primary_text)], model_dir)[0]
+    if isinstance(result, Exception):
+        raise result
+    return result
 
 
 def _primary_text(chunk_file: Path) -> tuple[str, str]:
@@ -222,37 +312,113 @@ def _iter_chunk_files(proto_dir: Path):
                 yield chunk_file
 
 
-def _process_chunk(
-    chunk_file: Path,
-    proto_dir: Path,
-    tokens_dir: Path | None,
+def _load_tokens_manifest(sidecar_dir: Path) -> dict[str, dict]:
+    try:
+        with open(sidecar_dir / TOKENS_MANIFEST) as f:
+            return json.load(f).get("chunks", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_tokens_manifest(sidecar_dir: Path, chunks: dict[str, dict]) -> None:
+    path = sidecar_dir / TOKENS_MANIFEST
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"chunks": chunks}, ensure_ascii=False, indent=1))
+    tmp.replace(path)
+
+
+def _is_up_to_date(entry: dict | None, source_sha: str, sidecar: Path) -> bool:
+    return (
+        entry is not None
+        and entry.get("sha") == source_sha
+        and entry.get("pipeline") == pipeline_version(entry.get("lang", ""))
+        and sidecar.exists()
+    )
+
+
+def _process_chunks(
+    chunk_files: list[Path],
+    sidecar_dir: Path,
+    manifest: dict[str, dict],
     model_dir: str,
     force: bool,
-) -> str:
-    """Tokenize one chunk and write its sidecar. Returns "generated", "skipped", or "failed"."""
-    if tokens_dir is not None:
-        rel_dir = chunk_file.parent.resolve().relative_to(proto_dir)
-        sidecar_dir = tokens_dir / rel_dir
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        sidecar_dir = chunk_file.parent
-    sidecar = sidecar_dir / token_sidecar_name(chunk_file)
-    if sidecar.exists() and not force:
-        return "skipped"
+) -> Counter[str]:
+    """Tokenize one version dir's out-of-date chunks as a batch, writing
+    their sidecars and updating `manifest` in place.
 
-    try:
-        cts_urn, primary_text = _primary_text(chunk_file)
-        lang, tokens = _tokenize_only(cts_urn, primary_text, model_dir)
-    except Exception as exc:
-        print(f"  FAILED: {chunk_file.name}: {exc}", file=sys.stderr)
-        return "failed"
+    Returns generated/skipped/failed counts."""
+    counts: Counter[str] = Counter()
+    pending: list[tuple[Path, str, str, str]] = []  # (chunk, sha, urn, text)
+    for chunk_file in chunk_files:
+        source_sha = hashlib.sha256(chunk_file.read_bytes()).hexdigest()
+        sidecar = sidecar_dir / token_sidecar_name(chunk_file)
+        if not force and _is_up_to_date(manifest.get(chunk_file.name), source_sha, sidecar):
+            counts["skipped"] += 1
+            continue
+        try:
+            cts_urn, primary_text = _primary_text(chunk_file)
+        except Exception as exc:
+            print(f"  FAILED: {chunk_file}: {exc}", file=sys.stderr)
+            counts["failed"] += 1
+            continue
+        pending.append((chunk_file, source_sha, cts_urn, primary_text))
 
-    payload = json.dumps(
-        {"urn": cts_urn, "lang": lang, "tokens": tokens}, ensure_ascii=False
-    ).encode("utf-8")
-    compressor = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
-    sidecar.write_bytes(compressor.compress(payload))
-    return "generated"
+    for start in range(0, len(pending), _BATCH_SIZE):
+        batch = pending[start : start + _BATCH_SIZE]
+        results = _tokenize_batch([(urn, text) for _f, _s, urn, text in batch], model_dir)
+        compressor = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+        for (chunk_file, source_sha, cts_urn, _text), result in zip(batch, results):
+            if isinstance(result, Exception):
+                print(f"  FAILED: {chunk_file}: {result}", file=sys.stderr)
+                counts["failed"] += 1
+                continue
+            lang, tokens = result
+            payload = json.dumps(
+                {"urn": cts_urn, "lang": lang, "tokens": tokens}, ensure_ascii=False
+            ).encode("utf-8")
+            (sidecar_dir / token_sidecar_name(chunk_file)).write_bytes(
+                compressor.compress(payload)
+            )
+            manifest[chunk_file.name] = {
+                "sha": source_sha,
+                "lang": lang,
+                "pipeline": pipeline_version(lang),
+            }
+            counts["generated"] += 1
+    return counts
+
+
+def _iter_chunk_dirs(proto_dir: Path):
+    """Yield (version_dir, [chunk files]) for every index.json under proto_dir."""
+    for index_file in sorted(proto_dir.glob("**/index.json")):
+        version_dir = index_file.parent
+        with open(index_file) as f:
+            chunks = json.load(f).get("chunks", [])
+        chunk_files = [version_dir / entry["file"] for entry in chunks]
+        yield version_dir, [c for c in chunk_files if c.exists()]
+
+
+def _prune_stale_sidecars(sidecar_dir: Path, chunk_files: list[Path]) -> int:
+    """Delete sidecars in sidecar_dir whose chunk no longer exists."""
+    expected = {token_sidecar_name(c) for c in chunk_files}
+    removed = 0
+    for sidecar in sidecar_dir.glob("*.tokens.json.zst"):
+        if sidecar.name not in expected:
+            sidecar.unlink()
+            removed += 1
+    return removed
+
+
+def _prune_missing_works(proto_dir: Path, tokens_dir: Path) -> int:
+    """Delete sidecar trees whose proto version dir no longer exists."""
+    removed = 0
+    for manifest in sorted(tokens_dir.glob(f"**/{TOKENS_MANIFEST}")):
+        sidecar_dir = manifest.parent
+        rel_dir = sidecar_dir.relative_to(tokens_dir)
+        if not (proto_dir / rel_dir / "index.json").exists():
+            shutil.rmtree(sidecar_dir)
+            removed += 1
+    return removed
 
 
 def tokenize_dir(
@@ -260,33 +426,66 @@ def tokenize_dir(
     tokens_dir: Path | None,
     model_dir: str = "./stanza_models",
     force: bool = False,
+    prune: bool = False,
 ) -> dict:
-    """Tokenize every compiled chunk under proto_dir. Returns generated/skipped/failed counts."""
+    """Tokenize every compiled chunk under proto_dir.
+
+    With `prune` (and a separate `tokens_dir`), also deletes sidecars for
+    chunks and works that are no longer in proto_dir -- use it when
+    proto_dir holds a complete compile of the corpus, as it does in CI.
+
+    Returns generated/skipped/failed (and pruned) counts."""
     proto_dir = proto_dir.resolve()
-    generated = skipped = failed = 0
+    generated = skipped = failed = pruned = 0
 
-    for chunk_file in _iter_chunk_files(proto_dir):
-        result = _process_chunk(chunk_file, proto_dir, tokens_dir, model_dir, force)
-        if result == "generated":
-            generated += 1
-        elif result == "skipped":
-            skipped += 1
+    for version_dir, chunk_files in _iter_chunk_dirs(proto_dir):
+        if tokens_dir is not None:
+            sidecar_dir = tokens_dir / version_dir.relative_to(proto_dir)
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            for name in PROTO_METADATA_FILES:
+                if (version_dir / name).exists():
+                    shutil.copyfile(version_dir / name, sidecar_dir / name)
         else:
-            failed += 1
+            sidecar_dir = version_dir
 
-        if (generated + skipped + failed) % 500 == 0:
-            print(f"So far: {generated} generated, {skipped} skipped, {failed} failed.")
+        manifest = _load_tokens_manifest(sidecar_dir)
+        counts = _process_chunks(chunk_files, sidecar_dir, manifest, model_dir, force)
+        generated += counts["generated"]
+        skipped += counts["skipped"]
+        failed += counts["failed"]
+        if counts["generated"] or counts["failed"]:
+            print(
+                f"{version_dir.relative_to(proto_dir)}: {counts['generated']} generated, "
+                f"{counts['failed']} failed (so far: {generated} generated, "
+                f"{skipped} skipped, {failed} failed)",
+                flush=True,
+            )
 
-    return {"generated": generated, "skipped": skipped, "failed": failed}
+        live = {c.name for c in chunk_files}
+        _write_tokens_manifest(
+            sidecar_dir, {k: v for k, v in manifest.items() if k in live}
+        )
+        if prune and tokens_dir is not None:
+            pruned += _prune_stale_sidecars(sidecar_dir, chunk_files)
+
+    if prune and tokens_dir is not None:
+        pruned += _prune_missing_works(proto_dir, tokens_dir)
+
+    return {
+        "generated": generated,
+        "skipped": skipped,
+        "failed": failed,
+        "pruned": pruned,
+    }
 
 
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Tokenize compiled chunk XML files in-process (fast pass: "
-        "tokenize-only, no POS/lemma/deps, no NLP server needed). Re-run "
-        "mvp-analyze later to upgrade sidecars in place with full analysis."
+        description="Tokenize compiled chunk XML files in-process, lemmatizing "
+        "Greek and Latin (no NLP server needed). Only chunks whose XML or "
+        "pipeline version changed since the last run are reprocessed."
     )
     parser.add_argument(
         "--proto-dir",
@@ -312,16 +511,22 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-tokenize even if a sidecar already exists",
+        help="Re-tokenize even if a sidecar is up to date",
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Delete sidecars for chunks/works no longer in --proto-dir",
     )
     args = parser.parse_args()
 
     result = tokenize_dir(
-        args.proto_dir, args.tokens_dir, args.model_dir, args.force
+        args.proto_dir, args.tokens_dir, args.model_dir, args.force, args.prune
     )
     print(
         f"Tokenization: {result['generated']} generated, "
-        f"{result['skipped']} skipped, {result['failed']} failed."
+        f"{result['skipped']} skipped, {result['failed']} failed, "
+        f"{result['pruned']} pruned."
     )
 
 

@@ -1,0 +1,7 @@
+[
+  {"name": "greekLit", "tag_name": "greeklit", "repo_owner": "PerseusDL", "repo_name": "canonical-greekLit", "branch": "master"},
+  {"name": "latinLit", "tag_name": "latinlit", "repo_owner": "PerseusDL", "repo_name": "canonical-latinLit", "branch": "master"},
+  {"name": "First1KGreek", "tag_name": "first1kgreek", "repo_owner": "PerseusDLCode", "repo_name": "First1KGreek", "branch": "editing"},
+  {"name": "Notre-Dame-Digitized-Latin-Collection", "tag_name": "nd-dlc", "repo_owner": "PerseusDLCode", "repo_name": "Notre-Dame-Digitized-Latin-Collection", "branch": "main"},
+  {"name": "grcnewxml", "tag_name": "grcnewxml", "repo_owner": "gregorycrane", "repo_name": "grcnewxml", "branch": "main"}
+]

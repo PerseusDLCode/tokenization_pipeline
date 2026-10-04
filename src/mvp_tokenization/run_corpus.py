@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Chain citeStructure compilation and fast-pass tokenization for a whole corpus.
+"""Chain citeStructure compilation and tokenization for a whole corpus.
 
 Single, resumable entry point: for a corpus repo (e.g. corpora/canonical-latinLit),
 walks its data/ tree for TEI files that have a citeStructure refsDecl, compiles each
 into citation chunks via perseus-cts's Chunker (skipping files that don't have one --
 about half the corpus isn't migrated to citeStructure yet, that's expected, not an
-error), then runs the fast tokenize-only pass (mvp_tokenization.run_tokenizer) against
+error), then runs mvp_tokenization.run_tokenizer (lemmatizing Greek and Latin) against
 everything that got compiled. Writes a JSON run manifest so a run's outcome is
 auditable rather than scrollback-only.
 
-Both stages are idempotent (skip-if-exists, override with --force), so interrupting
-and re-running only does the remaining work.
+Both stages are idempotent (compile skips by mtime, tokenize by content hash; override
+with --force), so interrupting and re-running only does the remaining work. Pass
+--prune when --proto-dir holds a complete compile of the corpus (as in CI) to drop
+sidecars for chunks and works that no longer exist.
 
     uv run mvp-pipeline --corpus-root ../corpora/canonical-latinLit \\
         --proto-dir ./proto-pages --tokens-dir ./tokenized-pages
@@ -128,7 +130,7 @@ def compile_corpus(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compile citeStructure-bearing works into citation chunks, "
-        "then tokenize them (fast pass) -- a single, resumable, idempotent run "
+        "then tokenize them -- a single, resumable, idempotent run "
         "over a whole corpus repo."
     )
     parser.add_argument(
@@ -143,6 +145,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--force", action="store_true", help="Recompile/re-tokenize even if outputs exist"
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Delete sidecars for chunks/works no longer in --proto-dir",
     )
     parser.add_argument(
         "--manifest",
@@ -170,7 +177,7 @@ def main() -> None:
 
     print(f"Tokenizing chunks under {proto_dir} ...")
     tokenize_result = tokenize_dir(
-        proto_dir, args.tokens_dir, args.model_dir, args.force
+        proto_dir, args.tokens_dir, args.model_dir, args.force, args.prune
     )
     print(f"Tokenize: {tokenize_result}")
 
