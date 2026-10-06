@@ -225,18 +225,97 @@ def _finalize_tokens(
     return tokens
 
 
+# Model input is capped at this many characters. Some chunks are whole
+# books (First1KGreek has chunks of 200,000+ words), and running a spaCy
+# pipeline over a document that size holds activations for every token at
+# once -- more memory than a hosted CI runner has. Longer texts are cut into
+# segments at sentence (or at least word) boundaries, run separately, and
+# their tokens shifted back into the whole text's coordinates.
+#
+# Measured on a 600k-character First1KGreek chunk with grc_dep_web_lg:
+# 2,000-char segments in batches of 8 peak at ~2 GB (model included), the
+# same throughput as larger settings, which peak at 3-6 GB.
+SEGMENT_CHARS = 2_000
+_SPACY_BATCH_SIZE = 8
+_SENTENCE_BREAKS = (". ", "\u00b7 ", "\u0387 ", "; ", "\n")
+
+
+# stanza's langid model runs over its whole input and needs roughly 90 MB
+# per thousand characters, so a book-length chunk would take tens of GB.
+# A chunk's language is identified from a sample instead: the whole text if
+# it's short, else slices from its beginning, middle and end (so front
+# matter in another language doesn't decide it alone).
+LANGID_SAMPLE_CHARS = 3_000
+
+
+def _langid_sample(text: str) -> str:
+    if len(text) <= LANGID_SAMPLE_CHARS:
+        return text
+    width = LANGID_SAMPLE_CHARS // 3
+    starts = (0, (len(text) - width) // 2, len(text) - width)
+    return " ".join(text[start : start + width] for start in starts)
+
+
+def _segments(text: str, limit: int | None = None) -> list[tuple[int, str]]:
+    """Split text into (offset, segment) pieces of at most `limit` chars
+    (default SEGMENT_CHARS).
+
+    Cuts go after the whitespace following a sentence break in the second
+    half of the window, else after the last space there, else at `limit`;
+    keeping the whitespace with the earlier segment preserves its last
+    token's trailing-whitespace flag."""
+    limit = limit or SEGMENT_CHARS
+    segments = []
+    start = 0
+    while len(text) - start > limit:
+        lo, hi = start + limit // 2, start + limit
+        cut = max(text.rfind(b, lo, hi) + len(b) for b in _SENTENCE_BREAKS)
+        if cut < lo + 1:
+            cut = text.rfind(" ", lo, hi) + 1
+        if cut < lo + 1:
+            cut = hi
+        segments.append((start, text[start:cut]))
+        start = cut
+    segments.append((start, text[start:]))
+    return segments
+
+
+def _shift(tokens: list[dict], chars: int, index: int) -> list[dict]:
+    """Move a segment's tokens into the whole text's coordinates: character
+    offsets by `chars`, and spaCy's doc-relative token indices by `index`
+    (stanza's ids are sentence-relative, so they're left alone)."""
+    for token in tokens:
+        token["start_char"] += chars
+        token["end_char"] += chars
+        if isinstance(token["id"], list):
+            token["id"] = [i + index for i in token["id"]]
+            for word in token["words"]:
+                word["id"] += index
+                if word["head"] is not None:
+                    word["head"] += index
+    return tokens
+
+
 def _raw_tokens(lang: str, texts: list[str], model_dir: str) -> list[list[dict]]:
+    pieces = [(i, offset, seg) for i, text in enumerate(texts) for offset, seg in _segments(text)]
+    segs = [seg for _i, _offset, seg in pieces]
     if lang in ANALYZE_LANGS:
         # Batched: per-call overhead dominates for short chunks.
-        docs = _get_spacy_pipeline(lang).pipe(texts, batch_size=64)
-        return [_spacy_token_dicts(doc) for doc in docs]
-    if lang in SPACY_MODELS:
+        docs = _get_spacy_pipeline(lang).pipe(segs, batch_size=_SPACY_BATCH_SIZE)
+        seg_tokens = (_spacy_token_dicts(doc) for doc in docs)
+    elif lang in SPACY_MODELS:
         # Bare tokenizer, not the full pipeline -- no tagger/lemmatizer
         # inference, even though the model is loaded.
-        docs = _get_spacy_pipeline(lang).tokenizer.pipe(texts)
-        return [_spacy_token_dicts(doc) for doc in docs]
-    pipeline = _get_stanza_pipeline(lang, model_dir)
-    return [_stanza_token_dicts(pipeline(text)) for text in texts]
+        docs = _get_spacy_pipeline(lang).tokenizer.pipe(segs)
+        seg_tokens = (_spacy_token_dicts(doc) for doc in docs)
+    else:
+        pipeline = _get_stanza_pipeline(lang, model_dir)
+        seg_tokens = (_stanza_token_dicts(pipeline(seg)) for seg in segs)
+
+    results: list[list[dict]] = [[] for _ in texts]
+    for (i, offset, _seg), tokens in zip(pieces, seg_tokens):
+        results[i].extend(_shift(tokens, offset, len(results[i])))
+    return results
 
 
 def _tokenize_batch(
@@ -253,7 +332,7 @@ def _tokenize_batch(
     if not nonempty:
         return results
 
-    docs = [StanzaDocument([], text=items[i][1]) for i in nonempty]
+    docs = [StanzaDocument([], text=_langid_sample(items[i][1])) for i in nonempty]
     _get_langid(model_dir)(docs)
     by_lang: dict[str, list[int]] = {}
     for i, doc in zip(nonempty, docs):

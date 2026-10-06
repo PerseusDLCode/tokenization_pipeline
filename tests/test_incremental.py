@@ -102,3 +102,35 @@ def test_time_budget_defers_and_next_run_resumes(tmp_path, calls):
 
     result = run_tokenizer.tokenize_dir(proto, tokens)
     assert (result["generated"], result["deferred"]) == (2, 0)
+
+
+def test_segments_cover_text_and_respect_limit():
+    text = ("Μῆνιν ἄειδε θεά. " * 40) + ("x" * 300) + (" ἄλγε’ ἔθηκε" * 30)
+    segments = run_tokenizer._segments(text, limit=100)
+    assert "".join(seg for _off, seg in segments) == text
+    assert all(len(seg) <= 100 for _off, seg in segments)
+    assert all(text[off : off + len(seg)] == seg for off, seg in segments)
+    # Sentence breaks are preferred, with the space kept on the left.
+    assert segments[0][1].endswith(". ")
+
+
+def test_segmented_tokens_map_back_to_source(monkeypatch):
+    text = "μῆνιν ἄειδε θεὰ Πηληϊάδεω Ἀχιλῆος οὐλομένην, ἣ μυρία Ἀχαιοῖς ἄλγε ἔθηκε. " * 6
+    (whole,) = run_tokenizer._raw_tokens("grc", [text], "./stanza_models")
+    monkeypatch.setattr(run_tokenizer, "SEGMENT_CHARS", 120)
+    assert len(run_tokenizer._segments(text)) > 1
+    (segmented,) = run_tokenizer._raw_tokens("grc", [text], "./stanza_models")
+    assert [(t["start_char"], t["end_char"], t["whitespace"]) for t in segmented] == [
+        (t["start_char"], t["end_char"], t["whitespace"]) for t in whole
+    ]
+    assert [t["id"] for t in segmented] == [[i] for i in range(len(segmented))]
+    assert all(text[t["start_char"] : t["end_char"]] == t["text"] for t in segmented)
+
+
+def test_langid_sample_is_bounded():
+    short = "μῆνιν ἄειδε θεά"
+    assert run_tokenizer._langid_sample(short) == short
+    long = "a" * 50_000 + "b" * 50_000 + "c" * 50_000
+    sample = run_tokenizer._langid_sample(long)
+    assert len(sample) <= run_tokenizer.LANGID_SAMPLE_CHARS + 2
+    assert sample.startswith("a") and "b" in sample and sample.endswith("c")
