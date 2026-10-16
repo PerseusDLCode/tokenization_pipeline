@@ -29,12 +29,21 @@ convenience:
 - The key indexes on ``forms`` and ``lemmas`` carry every column the
   browser reads, so resolving a key never needs a second seek into the
   table.
+- Dictionary-headword search ("every form of λύω") is precomputed from
+  pdl-morph-server's morph.db (``--morph-db``): ``morph_lemmas`` holds the
+  Morpheus headwords with at least one form in the corpus, and
+  ``morph_lemma_forms`` maps each to the corpus forms whose match key equals
+  a form Morpheus generates for it. A Morpheus lemma is identified by its
+  natural key, (headword, sequence_number, lang), never by morph.db's row
+  ids, which change on every rebuild of that database. Without
+  ``--morph-db`` both tables are empty and the page falls back to tagged
+  lemmas.
 
 Only the default citation scheme is indexed (sidecars directly in a version
 dir, not in its scheme subdirectories), since alternate schemes re-chunk the
 same text and would double every hit.
 
-    uv run mvp-index --tokens-dir ../tokens --out ./search-index
+    uv run mvp-index --tokens-dir ../tokens --morph-db ../morph.db --out ./search-index
 
 The output dir gets ``search-<sha12>.db`` (content-addressed, so it can be
 served as immutable) and ``manifest.json`` pointing at it.
@@ -57,7 +66,7 @@ import zstandard
 
 from mvp_tokenization.normalize import is_apostrophe, loose_key, match_key
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PAGE_SIZE = 4096
 DEFAULT_LANGS = ("grc", "la")
 SIDECAR_SUFFIX = ".tokens.json.zst"
@@ -66,6 +75,8 @@ CONTEXT_PART = 32
 
 _IDENTIFIER_OCC = re.compile(r"\[(\d+)\]$")
 _LANG_ALIASES = {"lat": "la"}
+# The index uses MVP's language codes; morph.db uses ISO 639-2 for Latin.
+_MORPH_LANGS = {"grc": "grc", "la": "lat"}
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
@@ -192,6 +203,72 @@ CREATE INDEX lemmas_loose ON lemmas (loose, lang, lemma_id, n, lemma);
 CREATE INDEX documents_base_urn ON documents (base_urn);
 """
 
+MORPH_SCHEMA = """
+CREATE TABLE morph_lemmas (
+  morph_id INTEGER PRIMARY KEY,
+  headword TEXT NOT NULL,
+  sequence_number INTEGER NOT NULL,
+  loose TEXT NOT NULL,
+  lang TEXT NOT NULL,
+  n INTEGER NOT NULL
+);
+
+CREATE TABLE morph_lemma_forms (
+  morph_id INTEGER NOT NULL,
+  form_id INTEGER NOT NULL,
+  PRIMARY KEY (morph_id, form_id)
+) WITHOUT ROWID;
+"""
+
+# Runs with morph.db attached as `morph` and temp.morph_langs mapping its
+# language codes to ours. match_key and loose_key are normalize.py's,
+# registered as SQL functions.
+MORPH_FILL = """
+CREATE TEMP TABLE morph_keys AS
+  SELECT DISTINCT p.lemma_id AS src_id, match_key(p.form, ml.lang) AS key, ml.lang
+  FROM (SELECT DISTINCT lemma_id, form FROM morph.parses) p
+  JOIN morph.lemmas l ON l.id = p.lemma_id
+  JOIN temp.morph_langs ml ON ml.code = l.language_code;
+
+CREATE TEMP TABLE morph_hits AS
+  SELECT DISTINCT k.src_id, f.form_id
+  FROM temp.morph_keys k JOIN forms f ON f.key = k.key AND f.lang = k.lang;
+
+-- n: corpus words with any of the lemma's forms (ambiguous forms count
+-- toward every lemma that can generate them).
+CREATE TEMP TABLE morph_found AS
+  SELECT
+    ROW_NUMBER() OVER (ORDER BY ml.lang, l.headword, l.sequence_number) AS morph_id,
+    s.src_id, l.headword, l.sequence_number, ml.lang, s.n
+  FROM (
+    SELECT h.src_id, SUM(f.n) AS n
+    FROM temp.morph_hits h JOIN forms f ON f.form_id = h.form_id
+    GROUP BY h.src_id
+  ) s
+  JOIN morph.lemmas l ON l.id = s.src_id
+  JOIN temp.morph_langs ml ON ml.code = l.language_code;
+
+INSERT INTO morph_lemmas
+  SELECT morph_id, headword, sequence_number, loose_key(headword, lang), lang, n
+  FROM temp.morph_found ORDER BY morph_id;
+
+INSERT INTO morph_lemma_forms
+  SELECT m.morph_id, h.form_id
+  FROM temp.morph_found m JOIN temp.morph_hits h ON h.src_id = m.src_id
+  ORDER BY m.morph_id, h.form_id;
+
+DROP TABLE temp.morph_keys;
+DROP TABLE temp.morph_hits;
+DROP TABLE temp.morph_found;
+"""
+
+MORPH_INDEXES = """
+CREATE INDEX morph_lemmas_loose
+  ON morph_lemmas (loose, lang, morph_id, headword, sequence_number, n);
+CREATE INDEX morph_lemmas_headword
+  ON morph_lemmas (headword, lang, sequence_number, morph_id, n);
+"""
+
 
 def _natural_key(name: str) -> list:
     stem = name[: -len(SIDECAR_SUFFIX)] if name.endswith(SIDECAR_SUFFIX) else name
@@ -244,10 +321,36 @@ class _Interner:
         return id_
 
 
+def _add_morph_lemmas(
+    conn: sqlite3.Connection, morph_db: Path | None, langs: tuple[str, ...]
+) -> int:
+    """Fill morph_lemmas and morph_lemma_forms from morph.db (left empty
+    without one). Needs forms and its key index. Returns the lemma count."""
+    conn.executescript(MORPH_SCHEMA)
+    if morph_db is not None:
+        if not morph_db.is_file():
+            raise FileNotFoundError(morph_db)
+        conn.create_function("match_key", 2, match_key, deterministic=True)
+        conn.create_function("loose_key", 2, loose_key, deterministic=True)
+        conn.execute("ATTACH DATABASE ? AS morph", (str(morph_db),))
+        conn.execute("CREATE TEMP TABLE morph_langs (code TEXT PRIMARY KEY, lang TEXT)")
+        conn.executemany(
+            "INSERT INTO temp.morph_langs VALUES (?,?)",
+            [(_MORPH_LANGS[lang], lang) for lang in langs if lang in _MORPH_LANGS],
+        )
+        conn.executescript(MORPH_FILL)
+        conn.execute("DROP TABLE temp.morph_langs")
+        conn.commit()
+        conn.execute("DETACH DATABASE morph")
+    conn.executescript(MORPH_INDEXES)
+    return conn.execute("SELECT COUNT(*) FROM morph_lemmas").fetchone()[0]
+
+
 def build_index(
     tokens_roots: list[Path],
     out_path: Path,
     langs: tuple[str, ...] = DEFAULT_LANGS,
+    morph_db: Path | None = None,
 ) -> dict:
     """Build the index at out_path. Returns summary stats."""
     out_path.unlink(missing_ok=True)
@@ -382,6 +485,9 @@ def build_index(
 
     print(f"Clustering postings ({time.time() - started:.0f}s) ...")
     conn.executescript(CLUSTERED)
+    if morph_db is not None:
+        print(f"Adding Morpheus headwords ({time.time() - started:.0f}s) ...")
+    morph_lemmas = _add_morph_lemmas(conn, morph_db, langs)
     built_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
     conn.executemany(
         "INSERT INTO meta VALUES (?,?)",
@@ -406,6 +512,7 @@ def build_index(
         "words": n_words,
         "forms": len(forms.ids),
         "lemmas": len(lemmas.ids),
+        "morph_lemmas": morph_lemmas,
         "skipped_chunks": skipped_chunks,
         "built_at": built_at,
         "seconds": round(time.time() - started),
@@ -425,11 +532,12 @@ def write_index(
     out_dir: Path,
     langs: tuple[str, ...] = DEFAULT_LANGS,
     sources: dict[str, str] | None = None,
+    morph_db: Path | None = None,
 ) -> dict:
     """Build the index into out_dir as search-<sha12>.db plus manifest.json."""
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = out_dir / "search.db.tmp"
-    stats = build_index(tokens_roots, tmp_path, langs)
+    stats = build_index(tokens_roots, tmp_path, langs, morph_db)
     digest = _sha256(tmp_path)
     db_name = f"search-{digest[:12]}.db"
     tmp_path.replace(out_dir / db_name)
@@ -464,6 +572,12 @@ def main() -> None:
     )
     parser.add_argument("--out", required=True, type=Path, help="Output directory")
     parser.add_argument(
+        "--morph-db",
+        type=Path,
+        help="pdl-morph-server's morph.db, for dictionary-headword search. "
+        "Without it, the index has no Morpheus headwords.",
+    )
+    parser.add_argument(
         "--langs",
         default=",".join(DEFAULT_LANGS),
         help=f"Comma-separated sidecar languages to index (default: {','.join(DEFAULT_LANGS)})",
@@ -480,7 +594,7 @@ def main() -> None:
 
     sources = dict(s.split("=", 1) for s in args.source)
     manifest = write_index(
-        args.tokens_dir, args.out, tuple(args.langs.split(",")), sources
+        args.tokens_dir, args.out, tuple(args.langs.split(",")), sources, args.morph_db
     )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
 
