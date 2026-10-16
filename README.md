@@ -21,7 +21,7 @@ corpus repo ──mvp-pipeline──► tokens tree ──mvp-index──► sea
 ```sh
 uv run mvp-pipeline --corpus-root ../corpora/canonical-latinLit \
     --proto-dir ./proto --tokens-dir ./tokens --prune
-uv run mvp-index --tokens-dir ./tokens --out ./search-index
+uv run mvp-index --tokens-dir ./tokens --morph-db ./morph.db --out ./search-index
 ```
 
 ### Incremental tokenization
@@ -74,9 +74,12 @@ schema in full. In brief:
   each version's default citation scheme, since alternate schemes would
   double every hit.
 
-Dictionary-headword search ("all forms of λύω") is resolved in the browser.
-The page reads the headword's forms from pdl-morph-server's `morph.db` and
-looks up their keys here, so the index has no dependency on Morpheus data.
+Dictionary-headword search ("all forms of λύω") is precomputed here from
+pdl-morph-server's `morph.db` (`--morph-db`). `morph_lemmas` holds every
+Morpheus headword with at least one form in the corpus, and
+`morph_lemma_forms` maps it to the corpus forms whose `key` matches a form
+Morpheus generates for it. The browser never reads `morph.db` itself. CI
+extracts `morph.db` from the `pdl-morph-server` image.
 
 ## CI
 

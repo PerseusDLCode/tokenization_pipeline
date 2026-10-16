@@ -154,3 +154,69 @@ def test_chunk_context_is_indexed_by_seq(tmp_path, monkeypatch):
         "SELECT seq FROM form_postings WHERE chunk_id = 1 ORDER BY seq DESC LIMIT 1"
     ).fetchone()
     assert tokens[seq].strip() == "μῆνιν"
+
+
+def _morph_db(tmp_path: Path) -> Path:
+    """A minimal stand-in for pdl-morph-server's morph.db: just the columns
+    mvp-index reads. Row ids are deliberately not the ones the index assigns."""
+    path = tmp_path / "morph.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE lemmas (
+          id INTEGER PRIMARY KEY, headword TEXT, sequence_number INTEGER,
+          language_code TEXT
+        );
+        CREATE TABLE parses (id INTEGER PRIMARY KEY, lemma_id INTEGER, form TEXT);
+        INSERT INTO lemmas VALUES
+          (10, 'μῆνις', 1, 'grc'),
+          (11, 'δέ', -1, 'grc'),
+          (12, 'λύω', -1, 'grc'),
+          (13, 'venio', -1, 'lat');
+        INSERT INTO parses (lemma_id, form) VALUES
+          (10, 'μῆνιν'), (10, 'μῆνιν'), (10, 'μήνιδος'),
+          (11, 'δέ'), (11, 'δ’'),
+          (12, 'λύω'),
+          (13, 'venio');
+        """
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _connect_morph(tmp_path):
+    out = tmp_path / "out"
+    manifest = write_index([_corpus(tmp_path)], out, morph_db=_morph_db(tmp_path))
+    return manifest, sqlite3.connect(out / manifest["db"])
+
+
+def test_morph_lemmas_keep_only_headwords_in_the_corpus(tmp_path):
+    manifest, conn = _connect_morph(tmp_path)
+    rows = conn.execute(
+        "SELECT headword, sequence_number, loose, lang, n FROM morph_lemmas ORDER BY morph_id"
+    ).fetchall()
+    # λύω and venio generate no corpus form (and there's no Latin text).
+    assert rows == [("δέ", -1, "δε", "grc", 1), ("μῆνις", 1, "μηνισ", "grc", 3)]
+    assert manifest["morph_lemmas"] == 2
+
+
+def test_morph_lemma_forms_match_by_key(tmp_path):
+    _, conn = _connect_morph(tmp_path)
+    forms = conn.execute(
+        """
+        SELECT l.headword, f.form FROM morph_lemmas l
+        JOIN morph_lemma_forms m ON m.morph_id = l.morph_id
+        JOIN forms f ON f.form_id = m.form_id
+        ORDER BY l.headword, f.form
+        """
+    ).fetchall()
+    # Case folds (Μῆνιν), and Morpheus's elided δ’ matches the corpus's δ
+    # before an apostrophe.
+    assert forms == [("δέ", "δ"), ("μῆνις", "Μῆνιν"), ("μῆνις", "μῆνιν")]
+
+
+def test_morph_tables_empty_without_morph_db(tmp_path):
+    manifest, conn = _connect(tmp_path)
+    assert manifest["morph_lemmas"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM morph_lemma_forms").fetchone()[0] == 0

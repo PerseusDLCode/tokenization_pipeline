@@ -2,8 +2,7 @@
 
 The search index (build_index.py) stores two keys per form and lemma, and
 MinimumViablePerseus's /search page recomputes the same keys in the browser
-(src/mvp/site/static/js/search/normalize.js) -- both for what the user types
-and for the Morpheus forms it reads out of pdl-morph-server's morph.db. The
+(src/mvp/site/static/js/search/normalize.js) for what the user types. The
 two implementations must agree exactly; tests/fixtures/normalization.json is
 the shared contract, and both test suites run against it. Change one side,
 change the other, and add a fixture case.

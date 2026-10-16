@@ -30,6 +30,15 @@ def main(out_dir: Path) -> None:
         "were the sidecars produced by the tokenize-only pass?"
     )
 
+    assert manifest.get("morph_lemmas", 0) > 0, "no Morpheus headwords -- was --morph-db passed?"
+    luo = conn.execute(
+        """
+        SELECT COUNT(*) FROM morph_lemmas l JOIN morph_lemma_forms USING (morph_id)
+        WHERE l.headword = 'λύω' AND l.lang = 'grc'
+        """
+    ).fetchone()[0]
+    assert luo > 10, f"only {luo} corpus forms of λύω"
+
     iliad = conn.execute(
         "SELECT first_chunk, last_chunk FROM documents WHERE base_urn = ?", (ILIAD,)
     ).fetchone()
@@ -45,7 +54,8 @@ def main(out_dir: Path) -> None:
 
     print(
         f"OK: {manifest['db']} -- {manifest['documents']} documents, "
-        f"{manifest['words']:,} words, {lemmatized:,} lemmatized"
+        f"{manifest['words']:,} words, {lemmatized:,} lemmatized, "
+        f"{manifest['morph_lemmas']:,} Morpheus headwords"
     )
 
 

@@ -10,9 +10,12 @@ name: Build search index
 # deploy/cron-deploy.sh pulls :latest and serves it at /search-index/, where
 # the /search page queries it over HTTP range requests.
 #
+# Dictionary-headword search is precomputed from the morph.db baked into
+# pdl-morph-server's image, so that image's digest is an input too.
+#
 # Always a full rebuild -- incrementality lives upstream, in the tokenizer --
-# so the index is a pure function of the tokens artifacts plus this repo's
-# code, and is skipped when neither changed.
+# so the index is a pure function of the tokens artifacts, morph.db, and this
+# repo's code, and is skipped when none of them changed.
 
 on:
   workflow_run:
@@ -40,6 +43,7 @@ jobs:
     timeout-minutes: 180
     env:
       INDEX: ghcr.io/perseusdlcode/mvp-search-index
+      MORPH_IMAGE: ghcr.io/perseusdlcode/pdl-morph-server:dev-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -69,7 +73,9 @@ jobs:
             fi
           done
           cat sources.txt
-          digest=$( (cat sources.txt; echo "code=${GITHUB_SHA}") | sha256sum | cut -c1-32)
+          morph=$(oras manifest fetch --descriptor "$MORPH_IMAGE" | jq -r .digest)
+          echo "morph=${morph}" > morph-source.txt
+          digest=$( (cat sources.txt morph-source.txt; echo "code=${GITHUB_SHA}") | sha256sum | cut -c1-32)
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Skip if already indexed
@@ -93,6 +99,18 @@ jobs:
           done < sources.txt
           du -sh tokens
 
+      - name: Extract morph.db
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          IFS='=' read -r _ morph < morph-source.txt
+          image="${MORPH_IMAGE%:*}@${morph}"
+          docker pull "$image"
+          id=$(docker create "$image")
+          docker cp "$id:/usr/share/nginx/html/morph/morph.db" morph.db
+          docker rm "$id"
+          docker rmi "$image"
+          ls -lh morph.db
+
       - name: Install uv
         if: steps.skip.outputs.skip != 'true'
         uses: astral-sh/setup-uv@v7
@@ -107,8 +125,9 @@ jobs:
           while IFS='=' read -r tag digest; do
             args+=(--tokens-dir "tokens/${tag}" --source "${tag}=${digest}")
           done < sources.txt
-          uv run mvp-index "${args[@]}" --out out
-          rm -rf tokens
+          args+=(--source "$(cat morph-source.txt)")
+          uv run mvp-index "${args[@]}" --morph-db morph.db --out out
+          rm -rf tokens morph.db
 
       - name: Smoke-test index
         if: steps.skip.outputs.skip != 'true'
