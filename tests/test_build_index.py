@@ -167,17 +167,21 @@ def _morph_db(tmp_path: Path) -> Path:
           id INTEGER PRIMARY KEY, headword TEXT, sequence_number INTEGER,
           language_code TEXT
         );
-        CREATE TABLE parses (id INTEGER PRIMARY KEY, lemma_id INTEGER, form TEXT);
+        CREATE TABLE parses (
+          id INTEGER PRIMARY KEY, lemma_id INTEGER, form TEXT, part_of_speech TEXT,
+          person TEXT, number TEXT, tense TEXT, mood TEXT, voice TEXT,
+          grammatical_case TEXT, gender TEXT, degree TEXT, dialect TEXT
+        );
         INSERT INTO lemmas VALUES
           (10, 'μῆνις', 1, 'grc'),
           (11, 'δέ', -1, 'grc'),
           (12, 'λύω', -1, 'grc'),
           (13, 'venio', -1, 'lat');
-        INSERT INTO parses (lemma_id, form) VALUES
-          (10, 'μῆνιν'), (10, 'μῆνιν'), (10, 'μήνιδος'),
-          (11, 'δέ'), (11, 'δ’'),
-          (12, 'λύω'),
-          (13, 'venio');
+        INSERT INTO parses (lemma_id, form, part_of_speech) VALUES
+          (10, 'μῆνιν', 'noun'), (10, 'μῆνιν', 'noun'), (10, 'μήνιδος', 'noun'),
+          (11, 'δέ', 'conj'), (11, 'δ’', 'conj'),
+          (12, 'λύω', 'verb'),
+          (13, 'venio', 'verb');
         """
     )
     conn.commit()
@@ -220,3 +224,121 @@ def test_morph_tables_empty_without_morph_db(tmp_path):
     manifest, conn = _connect(tmp_path)
     assert manifest["morph_lemmas"] == 0
     assert conn.execute("SELECT COUNT(*) FROM morph_lemma_forms").fetchone()[0] == 0
+    assert conn.execute("SELECT DISTINCT morph_id FROM form_postings").fetchall() == [(0,)]
+
+
+def _ambiguous_index(tmp_path):
+    """Forms Morpheus gives μῆνις (by way of Doric μᾶνις) and also a likelier
+    headword, each tagged a different way."""
+    root = tmp_path / "tokens"
+    version = root / "greekLit" / "tlg5023" / "tlg001" / "1st1K-grc1"
+    version.mkdir(parents=True)
+    base = "urn:cts:greekLit:tlg5023.tlg001.1st1K-grc1"
+    (version / "metadata.json").write_text(json.dumps({"document": {"base_urn": base}}))
+    chunk = f"{base}:1"
+    _write_sidecar(
+        version / "1.tokens.json.zst",
+        chunk,
+        "grc",
+        [
+            _token("μῆνιν", 1, "μῆνις", "NOUN", chunk=chunk),
+            # The tagger names the other headword.
+            _token("μανίας", 1, "μανία", "NOUN", chunk=chunk),
+            # The tagger names μῆνις, though not accented as Morpheus does.
+            _token("μανίας", 2, "μήνις", "NOUN", chunk=chunk),
+            # A lemma that's just the form: only the UPOS can decide.
+            _token("μανείς", 1, "μανείς", "VERB", chunk=chunk),
+            # ... and here it can't: both headwords are nouns.
+            _token("μηνί", 1, "μηνί", "NOUN", chunk=chunk),
+            # No analysis at all.
+            _token("μηνί", 2, chunk=chunk),
+        ],
+    )
+    morph = tmp_path / "morph.db"
+    conn = sqlite3.connect(morph)
+    conn.executescript(
+        """
+        CREATE TABLE lemmas (
+          id INTEGER PRIMARY KEY, headword TEXT, sequence_number INTEGER,
+          language_code TEXT
+        );
+        CREATE TABLE parses (
+          id INTEGER PRIMARY KEY, lemma_id INTEGER, form TEXT, part_of_speech TEXT,
+          person TEXT, number TEXT, tense TEXT, mood TEXT, voice TEXT,
+          grammatical_case TEXT, gender TEXT, degree TEXT, dialect TEXT
+        );
+        INSERT INTO lemmas VALUES
+          (1, 'μῆνις', -1, 'grc'), (2, 'μανία', -1, 'grc'),
+          (3, 'μαίνομαι', -1, 'grc'), (4, 'μείς', -1, 'grc');
+        INSERT INTO parses
+          (lemma_id, form, part_of_speech, number, grammatical_case, gender, dialect)
+        VALUES
+          (1, 'μῆνιν', 'noun', 'sg', 'acc', 'fem', NULL),
+          (1, 'μανίας', 'noun', 'pl', 'acc', 'fem', 'doric'),
+          (1, 'μανείς', 'noun', 'pl', 'nom', 'fem', 'attic doric'),
+          (1, 'μηνί', 'noun', 'sg', 'dat', 'fem', ''),
+          (2, 'μανίας', 'noun', 'sg', 'gen', 'fem', NULL),
+          (2, 'μανίας', 'noun', 'pl', 'acc', 'fem', NULL),
+          (4, 'μηνί', 'noun', 'sg', 'dat', 'masc', NULL);
+        INSERT INTO parses (lemma_id, form, part_of_speech, tense, voice, gender) VALUES
+          (3, 'μανείς', 'part', 'aor', 'pass', 'masc');
+        INSERT INTO parses (lemma_id, form, part_of_speech, person, number, mood) VALUES
+          (3, 'μανείς', 'verb', '2nd', 'sg', 'subj');
+        """
+    )
+    conn.commit()
+    conn.close()
+    out = tmp_path / "out"
+    manifest = write_index([root], out, morph_db=morph)
+    return sqlite3.connect(out / manifest["db"])
+
+
+def test_tagger_picks_between_morpheus_headwords(tmp_path):
+    conn = _ambiguous_index(tmp_path)
+    rows = conn.execute(
+        """
+        SELECT f.form, p.occ, IFNULL(m.headword, '-') FROM form_postings p
+        JOIN forms f ON f.form_id = p.form_id
+        LEFT JOIN morph_lemmas m ON m.morph_id = p.morph_id
+        ORDER BY p.seq
+        """
+    ).fetchall()
+    assert rows == [
+        # Only one headword: nothing to pick.
+        ("μῆνιν", 1, "-"),
+        ("μανίας", 1, "μανία"),
+        ("μανίας", 2, "μῆνις"),
+        ("μανείς", 1, "μαίνομαι"),
+        ("μηνί", 1, "-"),
+        ("μηνί", 2, "-"),
+    ]
+
+
+def test_form_doc_counts_split_by_tagged_headword(tmp_path):
+    conn = _ambiguous_index(tmp_path)
+    rows = conn.execute(
+        """
+        SELECT IFNULL(m.headword, '-'), c.n FROM form_doc_counts c
+        JOIN forms f ON f.form_id = c.form_id
+        LEFT JOIN morph_lemmas m ON m.morph_id = c.morph_id
+        WHERE f.form = 'μανίας' ORDER BY m.headword
+        """
+    ).fetchall()
+    assert rows == [("μανία", 1), ("μῆνις", 1)]
+
+
+def test_morph_analyses_list_every_headword_of_a_form(tmp_path):
+    conn = _ambiguous_index(tmp_path)
+    rows = conn.execute(
+        """
+        SELECT m.headword, a.analyses FROM morph_analyses a
+        JOIN forms f ON f.form_id = a.form_id
+        JOIN morph_lemmas m ON m.morph_id = a.morph_id
+        WHERE f.form = ? ORDER BY m.headword
+        """,
+        ("μανείς",),
+    ).fetchall()
+    assert rows == [
+        ("μαίνομαι", "part aor pass masc; verb 2nd sg subj"),
+        ("μῆνις", "noun pl nom fem (attic doric)"),
+    ]
