@@ -271,7 +271,7 @@ CREATE INDEX morph_lemmas_headword
 
 
 def _natural_key(name: str) -> list:
-    stem = name[: -len(SIDECAR_SUFFIX)] if name.endswith(SIDECAR_SUFFIX) else name
+    stem = name.removesuffix(SIDECAR_SUFFIX)
     return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in stem.split(".")]
 
 
@@ -396,7 +396,10 @@ def build_index(
                 chunk_base, _, ref = urn.rpartition(":")
                 base_urn = base_urn or chunk_base
                 if chunk_base != base_urn:
-                    print(f"  skipping {sidecar}: {urn} not in {base_urn}", file=sys.stderr)
+                    print(
+                        f"  skipping {sidecar}: {urn} not in {base_urn}",
+                        file=sys.stderr,
+                    )
                     skipped_chunks += 1
                     continue
                 doc_lang = doc_lang or lang
@@ -404,9 +407,15 @@ def build_index(
                 chunk_rows.append((chunk_id, next_doc_id, ref))
 
                 tokens = data.get("tokens", [])
-                texts = [t["text"] + (" " if t.get("whitespace") else "") for t in tokens]
+                texts = [
+                    t["text"] + (" " if t.get("whitespace") else "") for t in tokens
+                ]
                 text_rows.extend(
-                    (chunk_id, i // CONTEXT_PART, TOKEN_SEP.join(texts[i : i + CONTEXT_PART]))
+                    (
+                        chunk_id,
+                        i // CONTEXT_PART,
+                        TOKEN_SEP.join(texts[i : i + CONTEXT_PART]),
+                    )
                     for i in range(0, len(texts), CONTEXT_PART)
                 )
                 for seq, token in enumerate(tokens):
@@ -422,7 +431,12 @@ def build_index(
                     ):
                         key_text = text + "'"
                     form_id = forms.get(
-                        (text, match_key(key_text, lang), loose_key(key_text, lang), lang)
+                        (
+                            text,
+                            match_key(key_text, lang),
+                            loose_key(key_text, lang),
+                            lang,
+                        )
                     )
 
                     lemma_id = feat_id = None
@@ -432,7 +446,12 @@ def build_index(
                     lemma = word.get("lemma")
                     if lemma and not is_apostrophe(lemma):
                         lemma_id = lemmas.get(
-                            (lemma, match_key(lemma, lang), loose_key(lemma, lang), lang)
+                            (
+                                lemma,
+                                match_key(lemma, lang),
+                                loose_key(lemma, lang),
+                                lang,
+                            )
                         )
                         lemma_counts[lemma_id] += 1
                     if word.get("upos") or word.get("feats"):
