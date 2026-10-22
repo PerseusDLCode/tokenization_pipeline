@@ -36,8 +36,18 @@ convenience:
   a form Morpheus generates for it. A Morpheus lemma is identified by its
   natural key, (headword, sequence_number, lang), never by morph.db's row
   ids, which change on every rebuild of that database. Without
-  ``--morph-db`` both tables are empty and the page falls back to tagged
-  lemmas.
+  ``--morph-db`` these tables are empty and the page falls back to tagged
+  lemmas. ``morph_analyses`` holds Morpheus's analyses of each of those
+  forms under each of its headwords, clustered by form, so a search can show
+  what else a form might be.
+- Morpheus generates forms that are far likelier to belong to some other
+  headword (μανίας for μῆνις, by way of Doric μᾶνις), so where a form has
+  more than one Morpheus headword, the tagger picks between them:
+  ``form_postings.morph_id`` and ``form_doc_counts.morph_id`` are the
+  headword the tagger's lemma names, or, failing that, the only one whose
+  part of speech its UPOS fits (noun-like vs verb-like; see
+  ``_resolve_morph``). 0 means the tagger didn't settle it. A headword search
+  hides hits whose ``morph_id`` is some other headword.
 
 Only the default citation scheme is indexed (sidecars directly in a version
 dir, not in its scheme subdirectories), since alternate schemes re-chunk the
@@ -66,7 +76,7 @@ import zstandard
 
 from mvp_tokenization.normalize import is_apostrophe, loose_key, match_key
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PAGE_SIZE = 4096
 DEFAULT_LANGS = ("grc", "la")
 SIDECAR_SUFFIX = ".tokens.json.zst"
@@ -77,6 +87,20 @@ _IDENTIFIER_OCC = re.compile(r"\[(\d+)\]$")
 _LANG_ALIASES = {"lat": "la"}
 # The index uses MVP's language codes; morph.db uses ISO 639-2 for Latin.
 _MORPH_LANGS = {"grc": "grc", "la": "lat"}
+
+# The only part-of-speech distinction trusted to pick between Morpheus
+# headwords: noun-like vs verb-like. Finer ones (adverb vs particle vs
+# conjunction, say) are labelled too differently by Morpheus and UD to
+# compare. A participle is both.
+_UPOS_CLASSES = {
+    **dict.fromkeys(("NOUN", "PROPN", "ADJ", "PRON", "DET", "NUM"), "nominal"),
+    **dict.fromkeys(("VERB", "AUX"), "verbal"),
+}
+_MORPH_POS_CLASSES = {
+    **dict.fromkeys(("noun", "adj", "pron", "article", "numeral"), {"nominal"}),
+    "verb": {"verbal"},
+    "part": {"nominal", "verbal"},
+}
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
@@ -141,8 +165,11 @@ CREATE TABLE staging (
   form_id INTEGER NOT NULL,
   occ INTEGER NOT NULL,
   lemma_id INTEGER,
-  feat_id INTEGER
+  feat_id INTEGER,
+  morph_id INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX forms_key ON forms (key, lang, form_id, n, form);
 """
 
 CLUSTERED = """
@@ -153,10 +180,11 @@ CREATE TABLE form_postings (
   occ INTEGER NOT NULL,
   lemma_id INTEGER,
   feat_id INTEGER,
+  morph_id INTEGER NOT NULL,
   PRIMARY KEY (form_id, chunk_id, seq)
 ) WITHOUT ROWID;
 INSERT INTO form_postings
-  SELECT form_id, chunk_id, seq, occ, lemma_id, feat_id FROM staging
+  SELECT form_id, chunk_id, seq, occ, lemma_id, feat_id, morph_id FROM staging
   ORDER BY form_id, chunk_id, seq;
 
 CREATE TABLE lemma_postings (
@@ -173,15 +201,18 @@ INSERT INTO lemma_postings
   WHERE lemma_id IS NOT NULL
   ORDER BY lemma_id, chunk_id, seq;
 
+-- One row per headword the tagger chose for the form in the document
+-- (usually just morph_id 0), so a headword search can count what it shows.
 CREATE TABLE form_doc_counts (
   form_id INTEGER NOT NULL,
   doc_id INTEGER NOT NULL,
+  morph_id INTEGER NOT NULL,
   n INTEGER NOT NULL,
-  PRIMARY KEY (form_id, doc_id)
+  PRIMARY KEY (form_id, doc_id, morph_id)
 ) WITHOUT ROWID;
 INSERT INTO form_doc_counts
-  SELECT form_id, doc_id, COUNT(*) FROM staging
-  GROUP BY form_id, doc_id ORDER BY form_id, doc_id;
+  SELECT form_id, doc_id, morph_id, COUNT(*) FROM staging
+  GROUP BY form_id, doc_id, morph_id ORDER BY form_id, doc_id, morph_id;
 
 CREATE TABLE lemma_doc_counts (
   lemma_id INTEGER NOT NULL,
@@ -196,7 +227,6 @@ INSERT INTO lemma_doc_counts
 
 DROP TABLE staging;
 
-CREATE INDEX forms_key ON forms (key, lang, form_id, n, form);
 CREATE INDEX forms_loose ON forms (loose, lang, form_id, n, form);
 CREATE INDEX lemmas_key ON lemmas (key, lang, lemma_id, n, lemma);
 CREATE INDEX lemmas_loose ON lemmas (loose, lang, lemma_id, n, lemma);
@@ -218,21 +248,41 @@ CREATE TABLE morph_lemma_forms (
   form_id INTEGER NOT NULL,
   PRIMARY KEY (morph_id, form_id)
 ) WITHOUT ROWID;
+
+-- Every headword Morpheus gives a corpus form, with its analyses of the
+-- form under that headword ("noun acc pl fem (doric); ..."), so a search
+-- can show what else a form could be. Clustered by form.
+CREATE TABLE morph_analyses (
+  form_id INTEGER NOT NULL,
+  morph_id INTEGER NOT NULL,
+  analyses TEXT NOT NULL,
+  PRIMARY KEY (form_id, morph_id)
+) WITHOUT ROWID;
 """
 
 # Runs with morph.db attached as `morph` and temp.morph_langs mapping its
-# language codes to ours. match_key and loose_key are normalize.py's,
+# language codes to ours. match_key, loose_key and morph_analysis are
 # registered as SQL functions.
 MORPH_FILL = """
 CREATE TEMP TABLE morph_keys AS
-  SELECT DISTINCT p.lemma_id AS src_id, match_key(p.form, ml.lang) AS key, ml.lang
-  FROM (SELECT DISTINCT lemma_id, form FROM morph.parses) p
+  SELECT DISTINCT
+    p.lemma_id AS src_id, match_key(p.form, ml.lang) AS key, ml.lang,
+    p.part_of_speech AS pos,
+    morph_analysis(
+      p.part_of_speech, p.person, p.number, p.tense, p.mood, p.voice,
+      p.grammatical_case, p.gender, p.degree, p.dialect
+    ) AS analysis
+  FROM morph.parses p
   JOIN morph.lemmas l ON l.id = p.lemma_id
   JOIN temp.morph_langs ml ON ml.code = l.language_code;
 
-CREATE TEMP TABLE morph_hits AS
-  SELECT DISTINCT k.src_id, f.form_id
+-- One row per analysis Morpheus gives the form under the lemma.
+CREATE TEMP TABLE morph_hit_parses AS
+  SELECT DISTINCT k.src_id, f.form_id, k.pos, k.analysis
   FROM temp.morph_keys k JOIN forms f ON f.key = k.key AND f.lang = k.lang;
+
+CREATE TEMP TABLE morph_hits AS
+  SELECT DISTINCT src_id, form_id FROM temp.morph_hit_parses;
 
 -- n: corpus words with any of the lemma's forms (ambiguous forms count
 -- toward every lemma that can generate them).
@@ -257,7 +307,27 @@ INSERT INTO morph_lemma_forms
   FROM temp.morph_found m JOIN temp.morph_hits h ON h.src_id = m.src_id
   ORDER BY m.morph_id, h.form_id;
 
+INSERT INTO morph_analyses
+  SELECT form_id, morph_id, group_concat(analysis, '; ')
+  FROM (
+    SELECT DISTINCT h.form_id, m.morph_id, h.analysis
+    FROM temp.morph_found m JOIN temp.morph_hit_parses h ON h.src_id = m.src_id
+    ORDER BY h.form_id, m.morph_id, h.analysis
+  )
+  GROUP BY form_id, morph_id ORDER BY form_id, morph_id;
+
+-- The candidates the tagger has to pick between: forms with more than one
+-- headword, each headword with its parts of speech for the form.
+CREATE TEMP TABLE morph_candidates AS
+  SELECT m.morph_id, h.form_id, m.headword, m.lang, group_concat(DISTINCT h.pos) AS pos
+  FROM temp.morph_found m JOIN temp.morph_hit_parses h ON h.src_id = m.src_id
+  WHERE h.form_id IN (
+    SELECT form_id FROM temp.morph_hits GROUP BY form_id HAVING COUNT(*) > 1
+  )
+  GROUP BY m.morph_id, h.form_id;
+
 DROP TABLE temp.morph_keys;
+DROP TABLE temp.morph_hit_parses;
 DROP TABLE temp.morph_hits;
 DROP TABLE temp.morph_found;
 """
@@ -271,7 +341,7 @@ CREATE INDEX morph_lemmas_headword
 
 
 def _natural_key(name: str) -> list:
-    stem = name[: -len(SIDECAR_SUFFIX)] if name.endswith(SIDECAR_SUFFIX) else name
+    stem = name.removesuffix(SIDECAR_SUFFIX)
     return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in stem.split(".")]
 
 
@@ -321,17 +391,27 @@ class _Interner:
         return id_
 
 
+def _morph_analysis(pos, *features_and_dialect) -> str:
+    """One Morpheus parse as text, in Morpheus's own order: "verb 3rd sg
+    imperf ind act (homeric ionic)"."""
+    *features, dialect = features_and_dialect
+    text = " ".join(f for f in (pos, *features) if f)
+    return f"{text} ({dialect})" if dialect else text
+
+
 def _add_morph_lemmas(
     conn: sqlite3.Connection, morph_db: Path | None, langs: tuple[str, ...]
 ) -> int:
-    """Fill morph_lemmas and morph_lemma_forms from morph.db (left empty
-    without one). Needs forms and its key index. Returns the lemma count."""
+    """Fill morph_lemmas, morph_lemma_forms and morph_analyses from morph.db
+    (left empty without one), and resolve ambiguous forms in staging. Needs
+    forms and its key index. Returns the lemma count."""
     conn.executescript(MORPH_SCHEMA)
     if morph_db is not None:
         if not morph_db.is_file():
             raise FileNotFoundError(morph_db)
         conn.create_function("match_key", 2, match_key, deterministic=True)
         conn.create_function("loose_key", 2, loose_key, deterministic=True)
+        conn.create_function("morph_analysis", 10, _morph_analysis, deterministic=True)
         conn.execute("ATTACH DATABASE ? AS morph", (str(morph_db),))
         conn.execute("CREATE TEMP TABLE morph_langs (code TEXT PRIMARY KEY, lang TEXT)")
         conn.executemany(
@@ -342,8 +422,96 @@ def _add_morph_lemmas(
         conn.execute("DROP TABLE temp.morph_langs")
         conn.commit()
         conn.execute("DETACH DATABASE morph")
+        _resolve_morph(conn)
     conn.executescript(MORPH_INDEXES)
     return conn.execute("SELECT COUNT(*) FROM morph_lemmas").fetchone()[0]
+
+
+def _resolve_morph(conn: sqlite3.Connection) -> None:
+    """Set staging.morph_id for words whose form has more than one Morpheus
+    headword: the one the tagger chose, or 0 if it didn't settle it.
+
+    The tagger's lemma decides when it names one of the candidates (matched
+    by key, else ignoring accents, so its μήνις still names μῆνις). When it
+    names none -- its lemmas are often just the surface form -- its UPOS
+    decides if exactly one candidate fits it, so a VERB μήνιε goes to μηνίω,
+    not to the noun μῆνις. Anything else stays 0 and shows under every
+    candidate."""
+    candidates: dict[int, list[tuple[int, str, str, set[str] | None]]] = {}
+    for morph_id, form_id, headword, lang, pos in conn.execute(
+        "SELECT morph_id, form_id, headword, lang, pos FROM temp.morph_candidates"
+    ):
+        classes: set[str] | None = set()
+        for p in (pos or "").split(","):
+            if p not in _MORPH_POS_CLASSES:
+                classes = None  # a part of speech that fits any UPOS
+                break
+            classes |= _MORPH_POS_CLASSES[p]
+        candidates.setdefault(form_id, []).append(
+            (morph_id, match_key(headword, lang), loose_key(headword, lang), classes)
+        )
+    lemma_keys = {
+        lemma_id: (key, loose)
+        for lemma_id, key, loose in conn.execute("SELECT lemma_id, key, loose FROM lemmas")
+    }
+    upos_classes = {
+        feat_id: _UPOS_CLASSES.get(upos)
+        for feat_id, upos in conn.execute("SELECT feat_id, upos FROM feats")
+    }
+
+    def fits(candidate, upos_class):
+        classes = candidate[3]
+        return upos_class is None or classes is None or upos_class in classes
+
+    def resolve(form_id, lemma_id, feat_id):
+        cands = candidates[form_id]
+        upos_class = upos_classes.get(feat_id)
+        if lemma_id in lemma_keys:
+            key, loose = lemma_keys[lemma_id]
+            named = [c for c in cands if c[1] == key] or [c for c in cands if c[2] == loose]
+            if named:
+                # Homographs (two headwords, one spelling): the UPOS may still
+                # tell them apart.
+                cands = [c for c in named if fits(c, upos_class)] or named
+                return cands[0][0] if len(cands) == 1 else 0
+        cands = [c for c in cands if fits(c, upos_class)]
+        return cands[0][0] if len(cands) == 1 else 0
+
+    conn.execute(
+        "CREATE TEMP TABLE morph_resolved ("
+        " form_id INTEGER, lemma_id INTEGER, feat_id INTEGER, morph_id INTEGER,"
+        " PRIMARY KEY (form_id, lemma_id, feat_id)) WITHOUT ROWID"
+    )
+    combos = conn.execute(
+        """
+        SELECT DISTINCT form_id, IFNULL(lemma_id, 0), IFNULL(feat_id, 0) FROM staging
+        WHERE form_id IN (SELECT form_id FROM temp.morph_candidates)
+        """
+    ).fetchall()
+    conn.executemany(
+        "INSERT INTO temp.morph_resolved VALUES (?,?,?,?)",
+        (
+            (form_id, lemma_id, feat_id, morph_id)
+            for form_id, lemma_id, feat_id in combos
+            if (morph_id := resolve(form_id, lemma_id, feat_id))
+        ),
+    )
+    # A correlated lookup rather than UPDATE ... FROM, so that staging (which
+    # has no indexes) is scanned once.
+    conn.execute(
+        """
+        UPDATE staging SET morph_id = IFNULL((
+          SELECT r.morph_id FROM temp.morph_resolved r
+          WHERE r.form_id = staging.form_id
+            AND r.lemma_id = IFNULL(staging.lemma_id, 0)
+            AND r.feat_id = IFNULL(staging.feat_id, 0)
+        ), 0)
+        WHERE form_id IN (SELECT form_id FROM temp.morph_resolved)
+        """
+    )
+    conn.execute("DROP TABLE temp.morph_resolved")
+    conn.execute("DROP TABLE temp.morph_candidates")
+    conn.commit()
 
 
 def build_index(
@@ -396,7 +564,10 @@ def build_index(
                 chunk_base, _, ref = urn.rpartition(":")
                 base_urn = base_urn or chunk_base
                 if chunk_base != base_urn:
-                    print(f"  skipping {sidecar}: {urn} not in {base_urn}", file=sys.stderr)
+                    print(
+                        f"  skipping {sidecar}: {urn} not in {base_urn}",
+                        file=sys.stderr,
+                    )
                     skipped_chunks += 1
                     continue
                 doc_lang = doc_lang or lang
@@ -404,9 +575,15 @@ def build_index(
                 chunk_rows.append((chunk_id, next_doc_id, ref))
 
                 tokens = data.get("tokens", [])
-                texts = [t["text"] + (" " if t.get("whitespace") else "") for t in tokens]
+                texts = [
+                    t["text"] + (" " if t.get("whitespace") else "") for t in tokens
+                ]
                 text_rows.extend(
-                    (chunk_id, i // CONTEXT_PART, TOKEN_SEP.join(texts[i : i + CONTEXT_PART]))
+                    (
+                        chunk_id,
+                        i // CONTEXT_PART,
+                        TOKEN_SEP.join(texts[i : i + CONTEXT_PART]),
+                    )
                     for i in range(0, len(texts), CONTEXT_PART)
                 )
                 for seq, token in enumerate(tokens):
@@ -422,7 +599,12 @@ def build_index(
                     ):
                         key_text = text + "'"
                     form_id = forms.get(
-                        (text, match_key(key_text, lang), loose_key(key_text, lang), lang)
+                        (
+                            text,
+                            match_key(key_text, lang),
+                            loose_key(key_text, lang),
+                            lang,
+                        )
                     )
 
                     lemma_id = feat_id = None
@@ -432,7 +614,12 @@ def build_index(
                     lemma = word.get("lemma")
                     if lemma and not is_apostrophe(lemma):
                         lemma_id = lemmas.get(
-                            (lemma, match_key(lemma, lang), loose_key(lemma, lang), lang)
+                            (
+                                lemma,
+                                match_key(lemma, lang),
+                                loose_key(lemma, lang),
+                                lang,
+                            )
                         )
                         lemma_counts[lemma_id] += 1
                     if word.get("upos") or word.get("feats"):
@@ -463,7 +650,11 @@ def build_index(
             )
             conn.executemany("INSERT INTO chunks VALUES (?,?,?)", chunk_rows)
             conn.executemany("INSERT INTO chunk_context VALUES (?,?,?)", text_rows)
-            conn.executemany("INSERT INTO staging VALUES (?,?,?,?,?,?,?)", doc_rows)
+            conn.executemany(
+                "INSERT INTO staging (doc_id, chunk_id, seq, form_id, occ, lemma_id, feat_id)"
+                " VALUES (?,?,?,?,?,?,?)",
+                doc_rows,
+            )
             if doc_id % 200 == 0:
                 print(
                     f"  {doc_id} documents, {n_words:,} words "
@@ -483,11 +674,12 @@ def build_index(
     )
     conn.commit()
 
-    print(f"Clustering postings ({time.time() - started:.0f}s) ...")
-    conn.executescript(CLUSTERED)
+    # Before clustering: resolving headwords sets staging.morph_id.
     if morph_db is not None:
         print(f"Adding Morpheus headwords ({time.time() - started:.0f}s) ...")
     morph_lemmas = _add_morph_lemmas(conn, morph_db, langs)
+    print(f"Clustering postings ({time.time() - started:.0f}s) ...")
+    conn.executescript(CLUSTERED)
     built_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
     conn.executemany(
         "INSERT INTO meta VALUES (?,?)",
