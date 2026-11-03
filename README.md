@@ -21,7 +21,7 @@ corpus repo ──mvp-pipeline──► tokens tree ──mvp-index──► sea
 ```sh
 uv run mvp-pipeline --corpus-root ../corpora/canonical-latinLit \
     --proto-dir ./proto --tokens-dir ./tokens --prune
-uv run mvp-index --tokens-dir ./tokens --morph-db ./morph.db --out ./search-index
+uv run mvp-index --tokens-dir ./tokens --out ./search-index
 ```
 
 ### Incremental tokenization
@@ -46,8 +46,7 @@ within the chunk.
 
 A single SQLite file, read from the browser with
 [sql.js-httpvfs](https://github.com/phiresky/sql.js-httpvfs) over HTTP range
-requests. Only the pages a query touches are downloaded, the same way
-pdl-morph-server serves `morph.db`. `build_index.py`'s docstring describes the
+requests. Only the pages a query touches are downloaded. `build_index.py`'s docstring describes the
 schema in full. In brief:
 
 - **Range-friendly layout.** Pages are 4096 bytes, the journal is a rollback
@@ -73,13 +72,6 @@ schema in full. In brief:
 - **Scope.** Only Greek (`grc`) and Latin (`la`) chunks are indexed, and only
   each version's default citation scheme, since alternate schemes would
   double every hit.
-
-Dictionary-headword search ("all forms of λύω") is precomputed here from
-pdl-morph-server's `morph.db` (`--morph-db`). `morph_lemmas` holds every
-Morpheus headword with at least one form in the corpus, and
-`morph_lemma_forms` maps it to the corpus forms whose `key` matches a form
-Morpheus generates for it. The browser never reads `morph.db` itself. CI
-extracts `morph.db` from the `pdl-morph-server` image.
 
 ## CI
 
