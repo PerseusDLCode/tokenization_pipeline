@@ -10,8 +10,9 @@ name: Build search index
 # deploy/cron-deploy.sh pulls :latest and serves it at /search-index/, where
 # the /search page queries it over HTTP range requests.
 #
-# Dictionary-headword search is precomputed from the morph.db baked into
-# pdl-morph-server's image, so that image's digest is an input too.
+# Dictionary-headword search is precomputed from morph.db, which
+# pdl-morph-server publishes as a standalone, content-tagged artifact
+# (ghcr.io/perseusdlcode/morph-db), so that artifact's digest is an input too.
 #
 # Always a full rebuild -- incrementality lives upstream, in the tokenizer --
 # so the index is a pure function of the tokens artifacts, morph.db, and this
@@ -43,7 +44,7 @@ jobs:
     timeout-minutes: 180
     env:
       INDEX: ghcr.io/perseusdlcode/mvp-search-index
-      MORPH_IMAGE: ghcr.io/perseusdlcode/pdl-morph-server:dev-latest
+      MORPH_DB: ghcr.io/perseusdlcode/morph-db:latest
     steps:
       - uses: actions/checkout@v7
 
@@ -73,7 +74,7 @@ jobs:
             fi
           done
           cat sources.txt
-          morph=$(oras manifest fetch --descriptor "$MORPH_IMAGE" | jq -r .digest)
+          morph=$(oras manifest fetch --descriptor "$MORPH_DB" | jq -r .digest)
           echo "morph=${morph}" > morph-source.txt
           digest=$( (cat sources.txt morph-source.txt; echo "code=${GITHUB_SHA}") | sha256sum | cut -c1-32)
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
@@ -103,12 +104,7 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         run: |
           IFS='=' read -r _ morph < morph-source.txt
-          image="${MORPH_IMAGE%:*}@${morph}"
-          docker pull "$image"
-          id=$(docker create "$image")
-          docker cp "$id:/usr/share/nginx/html/morph/morph.db" morph.db
-          docker rm "$id"
-          docker rmi "$image"
+          oras pull "${MORPH_DB%:*}@${morph}" -o .
           ls -lh morph.db
 
       - name: Install uv
