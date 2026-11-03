@@ -10,8 +10,8 @@ change the other, and add a fixture case.
 - ``match_key``: accent-preserving, but erases the differences that don't
   distinguish words -- case, grave vs. acute (a grave is just an acute
   before another word), final vs. medial sigma, the various elision
-  apostrophes, and Latin u/v and i/j. This is what makes a Morpheus form
-  like ``δέ`` match the corpus's ``δὲ``. Latin marks (macrons, the odd
+  apostrophes, and Latin u/v and i/j. This is what makes a search for
+  ``δέ`` match the corpus's ``δὲ``. Latin marks (macrons, the odd
   accent) never distinguish forms, so for Latin this is the same as
   ``loose_key``.
 - ``loose_key``: ``match_key`` with every combining mark stripped too, for
@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import unicodedata
 
-# Elision marks as they actually occur in the corpora and in Morpheus's
-# forms, all folded to a plain ASCII apostrophe.
+# Elision marks as they actually occur in the corpora, all folded to a plain
+# ASCII apostrophe.
 APOSTROPHES = frozenset("'’ʼ᾽′΄")
 
 _COMBINING_GRAVE = "̀"
