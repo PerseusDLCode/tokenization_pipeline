@@ -4,8 +4,9 @@ Two separate passes, decoupled on purpose -- both fully in-process (no NLP
 server, no network dependency):
 
 - ``mvp-tokenize`` (:mod:`mvp_tokenization.run_tokenizer`) -- the main pass.
-  Greek and Latin get LatinCy's lemmatizing pipeline (minus parser/NER);
-  everything else gets tokenize-only stanza. Incremental by content hash.
+  Greek and Latin get lemmatizing spaCy pipelines (minus parser/NER):
+  grc_palimpsest_joint_trf for Greek, LatinCy's la_core_web_lg for Latin.
+  Everything else gets tokenize-only stanza. Incremental by content hash.
 - ``mvp-analyze`` (:mod:`mvp_tokenization.run_analyzer`) -- optional, on-demand
   full NLP annotation. Loads the full spaCy/stanza models in-process and
   upgrades an existing tokenize-only sidecar in place with POS/lemma/deps
