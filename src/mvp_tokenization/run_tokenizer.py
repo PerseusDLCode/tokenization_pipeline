@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tokenize compiled chunk XML files in-process, lemmatizing Greek and Latin.
 
-Greek and Latin chunks go through LatinCy's spaCy pipeline -- tagger,
+Greek and Latin chunks go through a spaCy pipeline -- tagger,
 morphologizer and lemmatizers, minus the parser and NER, which nothing
 downstream uses -- because the corpus search index (build_index.py) needs a
 lemma and morphology for every token. Every other language gets stanza's
@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -68,12 +69,15 @@ ANALYZE_LANGS = frozenset({"la", "grc"})
 # Unused by search and the most expensive components to run.
 SPACY_EXCLUDE = ["parser", "ner"]
 
-# Latin and Ancient Greek are handled by LatinCy's spaCy models rather than a
-# stanza package -- see nlp_pipeline/src/nlp_pipeline/pipeline.py, which
-# this script otherwise mirrors (tokenize-only, not the full pipeline).
+# Latin and Ancient Greek are handled by spaCy models rather than a stanza
+# package: LatinCy's la_core_web_lg for Latin, and grc_palimpsest_joint_trf
+# (a Greek BERT transformer pipeline, https://huggingface.co/pnadel/grc_palimpsest_joint_trf)
+# for Greek. The Greek model's tagger, morphologizer and lemmatizer all
+# listen to its transformer, so excluding the parser saves only the
+# parser's own small head; the transformer is most of the cost.
 SPACY_MODELS = {
     "la": "la_core_web_lg",
-    "grc": "grc_dep_web_lg",
+    "grc": "grc_palimpsest_joint_trf",
 }
 STANZA_LANGS = ["ar", "de", "en", "es", "fa", "fr", "he", "it", "pt"]
 
@@ -129,12 +133,16 @@ def _get_spacy_pipeline(lang: str) -> SpacyLanguage:
 
 
 def pipeline_version(lang: str) -> str:
-    """Identify everything that determines a sidecar's contents for `lang`."""
+    """Identify everything that determines a sidecar's contents for `lang`.
+
+    For spaCy models, the model package's version stands in for spaCy's own:
+    each model pins the spaCy versions it supports, and a spaCy patch
+    release within that range shouldn't force a corpus-wide rebuild."""
     if lang in SPACY_MODELS:
         model = SPACY_MODELS[lang]
         mode = "analyze" if lang in ANALYZE_LANGS else "tokenize"
         model_version = package_version(model.replace("_", "-"))
-        return f"{SIDECAR_SCHEMA}:spacy-{spacy.__version__}:{model}-{model_version}:{mode}"
+        return f"{SIDECAR_SCHEMA}:{model}-{model_version}:{mode}"
     if lang:
         return f"{SIDECAR_SCHEMA}:stanza-{stanza.__version__}:tokenize"
     return f"{SIDECAR_SCHEMA}:empty"
@@ -232,9 +240,11 @@ def _finalize_tokens(
 # segments at sentence (or at least word) boundaries, run separately, and
 # their tokens shifted back into the whole text's coordinates.
 #
-# Measured on a 600k-character First1KGreek chunk with grc_dep_web_lg:
-# 2,000-char segments in batches of 8 peak at ~2 GB (model included), the
-# same throughput as larger settings, which peak at 3-6 GB.
+# Measured on a 600k-character First1KGreek chunk with LatinCy's former
+# Greek model (grc_dep_web_lg): 2,000-char segments in batches of 8 peak at
+# ~2 GB (model included), the same throughput as larger settings, which
+# peak at 3-6 GB. grc_palimpsest_joint_trf peaks at ~3 GB on the same
+# settings (measured on the Iliad).
 SEGMENT_CHARS = 2_000
 _SPACY_BATCH_SIZE = 8
 _SENTENCE_BREAKS = (". ", "\u00b7 ", "\u0387 ", "; ", "\n")
@@ -407,11 +417,22 @@ def _write_tokens_manifest(sidecar_dir: Path, chunks: dict[str, dict]) -> None:
     tmp.replace(path)
 
 
+# Manifests written before pipeline_version dropped spaCy's version record
+# spaCy-model sidecars as "<schema>:spacy-<version>:<model>-<version>:<mode>".
+_LEGACY_SPACY_VERSION = re.compile(r"^(\d+):spacy-[^:]+:")
+
+
+def _current_pipeline(recorded: str | None, lang: str) -> bool:
+    if not recorded:
+        return False
+    return _LEGACY_SPACY_VERSION.sub(r"\1:", recorded) == pipeline_version(lang)
+
+
 def _is_up_to_date(entry: dict | None, source_sha: str, sidecar: Path) -> bool:
     return (
         entry is not None
         and entry.get("sha") == source_sha
-        and entry.get("pipeline") == pipeline_version(entry.get("lang", ""))
+        and _current_pipeline(entry.get("pipeline"), entry.get("lang", ""))
         and sidecar.exists()
     )
 

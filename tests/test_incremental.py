@@ -72,6 +72,16 @@ def test_pipeline_version_change_forces_rebuild(tmp_path, calls, monkeypatch):
     assert run_tokenizer.tokenize_dir(proto, tokens)["generated"] == 1
 
 
+def test_legacy_spacy_pipeline_version_is_current():
+    current = run_tokenizer.pipeline_version("la")
+    schema, rest = current.split(":", 1)
+    legacy = f"{schema}:spacy-3.8.15:{rest}"
+    assert run_tokenizer._current_pipeline(legacy, "la")
+    assert run_tokenizer._current_pipeline(current, "la")
+    assert not run_tokenizer._current_pipeline(f"{schema}:spacy-3.8.15:la_core_web_lg-0.0.1:analyze", "la")
+    assert not run_tokenizer._current_pipeline(None, "la")
+
+
 def test_prune_removes_deleted_chunks_and_works(tmp_path, calls):
     proto = _proto(tmp_path, {"1.xml": "<a/>", "2.xml": "<b/>"})
     tokens = tmp_path / "tokens"

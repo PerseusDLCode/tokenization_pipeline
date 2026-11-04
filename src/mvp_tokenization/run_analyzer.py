@@ -4,7 +4,7 @@
 This is the standalone-script counterpart to run_tokenizer.py: instead of
 loading only tokenize-only models, it loads the full
 tokenize+POS+lemma+depparse models directly in this process (stanza for
-most languages, LatinCy's spaCy models for `la`/`grc`) and writes the full
+most languages, spaCy models for `la`/`grc`) and writes the full
 morphological analysis straight into the same .tokens.json.zst sidecar
 format run_tokenizer.py already produces -- run_tokenizer.py's docstring
 anticipated exactly this: the sidecar's per-word fields are "mostly null
@@ -15,7 +15,7 @@ is needed.
 No NLP server, and no dependency on the nlp_pipeline package, is required:
 the routing/model logic here is a self-contained port of
 nlp_pipeline's NLPPipeline.analyze. Install the `nlp` dependency group
-(spacy, stanza, and the LatinCy wheels) into this repo's venv to run it:
+(spacy, stanza, and the spaCy model wheels) into this repo's venv to run it:
 
     uv sync --group nlp
     python src/mvp_tokenization/run_analyzer.py --proto-dir ./proto-pages --tokens-dir ./tokenized-pages
@@ -50,12 +50,12 @@ from mvp_tokenization.run_tokenizer import _iter_chunk_files, _primary_text
 
 _ZSTD_LEVEL = 19
 
-# Latin and Ancient Greek are handled by LatinCy's spaCy models rather
-# than a stanza package -- see nlp_pipeline/src/nlp_pipeline/pipeline.py,
+# Latin and Ancient Greek are handled by spaCy models (see
+# run_tokenizer.SPACY_MODELS) rather than a stanza package -- see nlp_pipeline/src/nlp_pipeline/pipeline.py,
 # which this script otherwise mirrors.
 SPACY_MODELS = {
     "la": "la_core_web_lg",
-    "grc": "grc_dep_web_lg",
+    "grc": "grc_palimpsest_joint_trf",
 }
 STANZA_LANGS = ["ar", "de", "en", "es", "fa", "fr", "he", "it", "pt"]
 STANZA_PROCESSORS = "tokenize,mwt,pos,lemma,depparse"

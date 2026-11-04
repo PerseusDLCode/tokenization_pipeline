@@ -14,7 +14,7 @@ corpus repo ──mvp-pipeline──► tokens tree ──mvp-index──► sea
 | Command | What it does |
 |---|---|
 | `mvp-pipeline` | Compiles a corpus repo's citeStructure-bearing TEI into citation chunks (perseus-cts), then runs `mvp-tokenize` over them. |
-| `mvp-tokenize` | Writes one token sidecar per chunk. Greek and Latin go through LatinCy's spaCy pipelines (tagger, morphologizer, lemmatizers; no parser/NER), so every token gets a lemma, UPOS and UD features. Other languages are tokenized only, with stanza. |
+| `mvp-tokenize` | Writes one token sidecar per chunk. Greek and Latin go through spaCy pipelines (tagger, morphologizer, lemmatizers; no parser/NER): [grc_palimpsest_joint_trf](https://huggingface.co/pnadel/grc_palimpsest_joint_trf) for Greek and LatinCy's `la_core_web_lg` for Latin, so every token gets a lemma, UPOS and UD features. Other languages are tokenized only, with stanza. |
 | `mvp-analyze` | Full stanza/spaCy analysis (including dependency parses) for any language. Not used by CI. |
 | `mvp-index` | Builds the corpus search index from one or more tokens trees. |
 
@@ -95,9 +95,9 @@ The search index then picks the corpus up automatically.
 ### Long runs
 
 A run for an unchanged corpus finishes in seconds. The first lemmatizing run
-does every chunk, at roughly 5,000 words/s for Greek and 1,000 for Latin on
-one core, which for the big corpora is longer than a hosted runner allows. So
-the workflow runs `mvp-pipeline --time-budget-minutes`, which stops between
+does every chunk, at roughly 700 words/s for Greek (a transformer, on four
+threads of an M1 Pro) and 1,000 for Latin on one core, which for the big
+corpora is longer than a hosted runner allows. So the workflow runs `mvp-pipeline --time-budget-minutes`, which stops between
 batches when the budget is spent. It then pushes what it has (tagged
 `<sha>-partial-<run id>` and `:latest`) and dispatches itself again for that
 corpus. Each follow-up restores `:latest` and continues. Only a complete run
